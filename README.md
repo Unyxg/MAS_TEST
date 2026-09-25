@@ -14,6 +14,23 @@ A PyQt6 desktop workbench for **manual testing of Windows applications with Azur
 
 ![Published](docs/ui_published.png)
 
+## Download the Windows app
+
+Every push runs the **Windows build** workflow (`.github/workflows/windows-build.yml`) on a real Windows machine. It:
+
+1. runs the unit tests,
+2. runs a **smoke test**: it launches Notepad, embeds it (both modes), captures a screenshot and a GIF, and runs it as administrator and as a different user,
+3. builds `MAS-QA-Bridge.exe` with PyInstaller and runs its `--self-test`,
+4. uploads the **`MAS-QA-Bridge-windows`** artifact.
+
+To get the app: open GitHub → **Actions** → *Windows build* → the latest run → **Artifacts** → `MAS-QA-Bridge-windows` (a zip). Unzip it anywhere and run:
+
+- `Run Demo.bat` to try it without Azure DevOps,
+- `MAS-QA-Bridge.exe` for real work. Edit the `config.yaml` next to it first.
+- `MAS-QA-Bridge.exe --self-test` writes `self_test.log`, which is useful if something doesn't start.
+
+The .exe is not code-signed, so Windows SmartScreen may warn you the first time. Click *More info → Run anyway*.
+
 ## Quick look (no Azure DevOps needed)
 
 ```powershell
@@ -132,9 +149,28 @@ It only sends fields that exist in your project's process (Agile, Scrum and CMMI
 | `qa_session.py` | Data model of one test execution: steps, their outcomes, evidence, timing and bugs raised. |
 | `bug_report.py` | Structure of a bug report, its validation, the Repro Steps HTML, and local drafts. |
 | `bug_dialog.py` | The "Report a bug" form: pre-filled, validated, with a live preview. |
+| `run_as.py` | Launching as administrator (UAC) or as another user; elevation checks; Credential Manager. |
+| `self_test.py` | `--self-test`: checks an installed build without opening a window. |
+| `packaging/`, `.github/workflows/` | PyInstaller spec and the Windows build, smoke test and packaging pipeline. |
 | `system_info.py` | Environment details: the .exe version, OS build, display/DPI, locale, tester. |
 | `demo_data.py` | `--demo`: sample ADO data plus the sample app. |
 | `tests/` | `pytest` tests that run offline against the demo data. |
+
+## Run as: me / administrator / different user
+
+A program started normally runs as the **same Windows account, with the same elevation**, as the program that started it. So if you start MAS-QA-Bridge as administrator, or with *Run as different user*, then **"Run as: me"** launches the application under test as that same account.
+
+To launch it differently from how MAS-QA-Bridge is running, use the header selector:
+
+| Choice | How | Notes |
+|---|---|---|
+| **Run as: me** | normal launch | same account and elevation as MAS-QA-Bridge |
+| **Run as: administrator** | UAC prompt (`runas`) | On a standard account, UAC asks for an admin's credentials, and the app runs as that admin. |
+| **Run as: different user…** | `CreateProcessWithLogonW` (same as Explorer's *Run as different user*) | Asks for an account and password. The password can be remembered in **Windows Credential Manager**, and is never written to config. The app runs with that user's profile, not elevated. |
+
+**Embedding elevated apps:** Windows (UIPI) does not let a non-elevated program take over an elevated window. If you choose *administrator* while MAS-QA-Bridge is not elevated, the app offers to **restart MAS-QA-Bridge as administrator** (recommended; the app is then embedded as usual), or to run the app in a **separate window** (evidence recording still captures the area). Apps started as a *different user* (not elevated) can be embedded normally.
+
+The account the app ran as is added to every bug's **Environment** section ("Application ran as").
 
 ## Embedding modes (header drop-down)
 
@@ -147,7 +183,7 @@ Microsoft doesn't recommend cross-process `SetParent`: the two apps' input queue
 
 ## Known limitations
 
-- A dashboard that isn't running as Administrator cannot embed an elevated app (UIPI). Run both at the same privilege level.
+- A dashboard that isn't running as administrator cannot embed an elevated app (UIPI). Use *Restart as administrator*.
 - UWP/Store apps (for example the Windows 11 Calculator) cannot be embedded.
 - Recording captures the screen, so anything covering the application area is recorded too.
 - Step-level attachments use the `iterationId`/`actionPath` query parameters. If a server rejects them, the file is attached to the result instead and a warning is logged.

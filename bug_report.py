@@ -134,6 +134,8 @@ class BugReport:
             warnings.append("Expected result is empty.")
         if not self.found_in.strip():
             warnings.append("'Found in build' is empty - developers need the application version.")
+        if not self.assigned_to.strip():
+            warnings.append("'Assigned to' is empty - set bug.default_assigned_to in config.yaml.")
         if not self.attachments:
             warnings.append("No screenshot or recording attached.")
         return errors, warnings

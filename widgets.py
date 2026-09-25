@@ -7,6 +7,7 @@ widgets.py - Reusable UI building blocks for the MAS-QA-Bridge dashboard.
     EvidencePanel  record / screenshot controls and captured evidence list
     PublishPanel   outcome, comment, bugs raised and Publish button
     StatusPill     small coloured status badge
+    RunAsDialog    account + password for "Run as different user"
 """
 from __future__ import annotations
 
@@ -16,7 +17,11 @@ from typing import Optional
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -650,3 +655,55 @@ class PublishPanel(QFrame):
         self.comment_edit.clear()
         self.status.clear()
         self.show_bugs([])
+
+
+# ----------------------------------------------------------------------------
+class RunAsDialog(QDialog):
+    """Ask for the Windows account to run the application under test as."""
+
+    def __init__(self, account: str = "", password: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Run as different user")
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        intro = QLabel(
+            "The application will run with this account's permissions and profile "
+            "(same as Explorer's <i>Run as different user</i>)."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("muted")
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.account_edit = QLineEdit(account)
+        self.account_edit.setPlaceholderText(r"DOMAIN\user, .\localuser or user@company.com")
+        self.password_edit = QLineEdit(password)
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Account", self.account_edit)
+        form.addRow("Password", self.password_edit)
+        layout.addLayout(form)
+        self.remember = QCheckBox("Remember password in Windows Credential Manager")
+        self.remember.setChecked(bool(password))
+        layout.addWidget(self.remember)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        (self.password_edit if account else self.account_edit).setFocus()
+
+    def _accept(self) -> None:
+        if self.account_edit.text().strip() and self.password_edit.text():
+            self.accept()
+
+    @property
+    def account(self) -> str:
+        return self.account_edit.text().strip()
+
+    @property
+    def password(self) -> str:
+        return self.password_edit.text()

@@ -1,0 +1,71 @@
+name: Windows build
+
+on:
+  push:
+    branches: ["claude/**", "main", "master"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Unit tests
+        run: python -m pytest -q tests
+
+      - name: Create a throw-away local account for the run-as test
+        shell: pwsh
+        run: |
+          $pw = "Mq!" + [guid]::NewGuid().ToString("N").Substring(0, 14)
+          Write-Output "::add-mask::$pw"
+          net user masqa_smoke $pw /add | Out-Null
+          "SMOKE_USER=masqa_smoke" >> $env:GITHUB_ENV
+          "SMOKE_PASS=$pw" >> $env:GITHUB_ENV
+
+      - name: Smoke test on real Windows (embedding, capture, run as admin / other user)
+        env:
+          SMOKE_OUT: smoke_out
+        run: python tests/windows_smoke.py
+
+      - name: Build MAS-QA-Bridge.exe
+        run: pyinstaller --noconfirm packaging/mas_qa_bridge.spec
+
+      - name: Assemble package
+        shell: pwsh
+        run: |
+          $dist = "dist\MAS-QA-Bridge"
+          Copy-Item config.yaml, README.md $dist
+          Set-Content -Path "$dist\Run Demo.bat" -Value '@start "" "%~dp0MAS-QA-Bridge.exe" --demo' -Encoding ascii
+
+      - name: Self-test the packaged exe
+        shell: pwsh
+        run: |
+          $dist = "dist\MAS-QA-Bridge"
+          $p = Start-Process -FilePath "$dist\MAS-QA-Bridge.exe" -ArgumentList "--self-test" -Wait -PassThru
+          Get-Content "$dist\self_test.log"
+          Remove-Item "$dist\self_test.log"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Upload MAS-QA-Bridge (Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAS-QA-Bridge-windows
+          path: dist/MAS-QA-Bridge/
+
+      - name: Upload smoke-test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-screens
+          path: smoke_out/

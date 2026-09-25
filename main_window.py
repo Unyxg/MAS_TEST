@@ -31,6 +31,7 @@ from PyQt6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QMoveEvent,
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QFrame,
@@ -52,16 +53,23 @@ from evidence_capture import EvidenceRecorder, Region
 from qa_session import FAILED, PASSED, UNSPECIFIED, EvidenceItem, TestPoint, TestSession
 from system_info import collect_environment, get_file_version
 from theme import STYLESHEET
-from widgets import EvidencePanel, HostFrame, PublishPanel, StatusPill, StepRunner, TestExplorer
+from widgets import EvidencePanel, HostFrame, PublishPanel, RunAsDialog, StatusPill, StepRunner, TestExplorer
+import run_as
 from window_manager import IS_WINDOWS, EmbedError, WindowManager
 
 if IS_WINDOWS:
     import win32gui
 
 APP_NAME = "MAS-QA-Bridge"
-BASE_DIR = Path(__file__).resolve().parent
+# Frozen (PyInstaller) builds keep config.yaml and temp_evidence next to the .exe.
+BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock")]
+RUN_AS_CHOICES = [
+    ("Run as: me", run_as.RUN_AS_CURRENT),
+    ("Run as: administrator", run_as.RUN_AS_ADMIN),
+    ("Run as: different user…", run_as.RUN_AS_USER),
+]
 
 log = logging.getLogger(APP_NAME)
 
@@ -184,7 +192,11 @@ class MainWindow(QMainWindow):
 
     # ================================================================== UI
     def _build_ui(self) -> None:
-        self.setWindowTitle(APP_NAME + (" — DEMO" if self.demo else ""))
+        self.is_admin = run_as.is_admin()
+        self._force_close = False
+        self.setWindowTitle(
+            APP_NAME + (" — DEMO" if self.demo else "") + (" (Administrator)" if self.is_admin else "")
+        )
         self.resize(1680, 980)
         self.setStyleSheet(STYLESHEET)
 
@@ -312,6 +324,16 @@ class MainWindow(QMainWindow):
             "use for apps that misbehave when re-parented (Electron, some WPF)."
         )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.run_as_combo = QComboBox()
+        for label, mode in RUN_AS_CHOICES:
+            self.run_as_combo.addItem(label, mode)
+        configured_run_as = str(self.app_cfg.get("run_as", run_as.RUN_AS_CURRENT))
+        self.run_as_combo.setCurrentIndex(max(0, self.run_as_combo.findData(configured_run_as)))
+        self.run_as_combo.setToolTip(
+            f"MAS-QA-Bridge is running as {run_as.current_account()}"
+            + (" (elevated)" if self.is_admin else "")
+            + ".\n'Run as: me' launches the application with this same account and elevation."
+        )
         self.launch_btn = QPushButton("▶ Launch")
         self.launch_btn.setObjectName("primary")
         self.launch_btn.clicked.connect(self.launch_and_embed)
@@ -320,13 +342,18 @@ class MainWindow(QMainWindow):
         self.release_btn.clicked.connect(self.toggle_release)
         self.kill_btn = QPushButton("■ Stop app")
         self.kill_btn.clicked.connect(self.terminate_app)
-        for widget in (self.browse_btn, self.exe_label, self.mode_combo, self.launch_btn, self.release_btn, self.kill_btn):
+        for combo in (self.mode_combo, self.run_as_combo):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(13)
+        self.exe_label.setMinimumWidth(160)
+        for widget in (self.browse_btn, self.exe_label, self.mode_combo, self.run_as_combo, self.launch_btn, self.release_btn, self.kill_btn):
             row.addWidget(widget, stretch=1 if widget is self.exe_label else 0)
 
         row.addSpacing(12)
         self.rec_pill = StatusPill("", "idle")
         self.rec_pill.hide()
         self.ado_pill = StatusPill("ADO: not configured", "warn")
+        self.ado_pill.setMaximumWidth(300)
         self.bug_btn = QPushButton("🐞 Report bug")
         self.bug_btn.setObjectName("bugLink")
         self.bug_btn.setToolTip("Raise a bug for the development team (Ctrl+B)")
@@ -427,10 +454,11 @@ class MainWindow(QMainWindow):
         self.publish_panel.bug_btn.setEnabled(self.ado_client is not None)
         self.bug_btn.setEnabled(self.ado_client is not None)
         self.check_btn.setEnabled(self.ado_client is not None)
+        who = f" · {wm.run_as_label}" if wm.run_as_label else ""
         if embedded:
-            self.app_state.set_state(f"{'Embedded' if wm.mode == 'reparent' else 'Docked'} · PID {wm.pid}", "ok")
+            self.app_state.set_state(f"{'Embedded' if wm.mode == 'reparent' else 'Docked'} · PID {wm.pid}{who}", "ok")
         elif has_window:
-            self.app_state.set_state(f"Popped out · PID {wm.pid}", "info")
+            self.app_state.set_state(f"Separate window · PID {wm.pid}{who}", "info")
         elif wm.pid is not None:
             self.app_state.set_state("Starting…", "warn")
         else:
@@ -482,8 +510,30 @@ class MainWindow(QMainWindow):
                 return
             self.window_manager.terminate()
 
+        mode = self.run_as_combo.currentData()
+        credentials = None
+        if mode == run_as.RUN_AS_ADMIN and not self.is_admin:
+            choice = self._ask_elevation()
+            if choice == "restart":
+                self.restart_as_admin()
+                return
+            if choice is None:
+                return
+        elif mode == run_as.RUN_AS_USER:
+            credentials = self._ask_credentials()
+            if credentials is None:
+                return
+
         try:
-            self.window_manager.launch(self.exe_path, args=self.app_cfg.get("launch_args") or [])
+            self.window_manager.launch(
+                self.exe_path,
+                args=self.app_cfg.get("launch_args") or [],
+                run_as_mode=mode,
+                credentials=credentials,
+            )
+        except PermissionError as exc:
+            self._show_error(str(exc))
+            return
         except Exception as exc:
             self._show_error(f"Could not launch {self.exe_path}: {exc}")
             return
@@ -497,7 +547,63 @@ class MainWindow(QMainWindow):
             on_finished=self._update_controls,
         )
 
+    def _ask_elevation(self) -> Optional[str]:
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Run the application as administrator")
+        box.setInformativeText(
+            "MAS-QA-Bridge is not running as administrator. Windows does not allow a non-elevated "
+            "program to embed an elevated window.\n\n"
+            "• Restart MAS-QA-Bridge as administrator (recommended): the app is embedded as usual.\n"
+            "• Launch elevated in a separate window: works, but the app stays outside the dashboard "
+            "(recording still captures the screen area)."
+        )
+        restart = box.addButton("Restart as administrator", QMessageBox.ButtonRole.AcceptRole)
+        separate = box.addButton("Separate window", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() is restart:
+            return "restart"
+        if box.clickedButton() is separate:
+            return "separate"
+        return None
+
+    def restart_as_admin(self) -> None:
+        if self._session_dirty():
+            answer = QMessageBox.question(self, APP_NAME, "Unpublished results will be lost. Restart anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        extra = ["--demo"] if self.demo and "--demo" not in sys.argv else []
+        if run_as.restart_self_as_admin(extra):
+            self._force_close = True
+            self.close()
+        else:
+            self._show_error("Could not restart as administrator (the UAC prompt was cancelled or failed).")
+
+    def _ask_credentials(self) -> Optional[run_as.Credentials]:
+        account = str(self.app_cfg.get("run_as_account") or getattr(self, "_last_account", "") or "")
+        dialog = RunAsDialog(account, run_as.load_password(account) or "", self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        self._last_account = dialog.account
+        try:
+            if dialog.remember.isChecked():
+                run_as.save_password(dialog.account, dialog.password)
+            else:
+                run_as.forget_password(dialog.account)
+        except Exception as exc:
+            log.warning("Credential Manager not available: %s", exc)
+        return run_as.Credentials.parse(dialog.account, dialog.password)
+
     def _embed_window(self, hwnd: Optional[int] = None) -> None:
+        allowed, reason = self.window_manager.can_embed()
+        if not allowed:
+            # Elevated app with a non-elevated dashboard: leave it as its own window.
+            log.info("Not embedding: %s", reason)
+            self.statusBar().showMessage("Running elevated in a separate window (restart as administrator to embed)")
+            self._update_controls()
+            return
         try:
             self.window_manager.embed(
                 self.host_frame.native_handle(),
@@ -556,7 +662,7 @@ class MainWindow(QMainWindow):
 
     def _on_plans(self, plans: list[dict]) -> None:
         cfg = self.ado_client.config
-        self.ado_pill.set_state(f"ADO: {cfg.organization}/{cfg.project}" + (" (demo)" if self.demo else ""), "ok")
+        self.ado_pill.set_state(f"ADO ✓ {cfg.organization}/{cfg.project}" + (" · demo" if self.demo else ""), "ok")
         if not plans:
             self.explorer.set_message("No active test plans in this project.")
         self.explorer.set_plans(plans, select_id=cfg.test_plan_id)
@@ -790,6 +896,8 @@ class MainWindow(QMainWindow):
             configuration=session.point.configuration if session else None,
             include_machine_name=bool(self.bug_cfg.get("include_machine_name", True)),
         )
+        if self.window_manager.run_as_label:
+            environment["Application ran as"] = self.window_manager.run_as_label
         found_in = str(self.bug_cfg.get("app_version") or self._app_version or "")
         report = BugReport.from_session(session, step_index, environment, found_in)
         if session is None:
@@ -886,7 +994,7 @@ class MainWindow(QMainWindow):
 
     # ============================================================ shutdown
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._session_dirty():
+        if self._session_dirty() and not self._force_close:
             answer = QMessageBox.question(self, APP_NAME, "There are unpublished results. Quit anyway?")
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
@@ -908,7 +1016,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--demo", action="store_true", help="offline demo with sample Azure DevOps data")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="path to config.yaml")
+    parser.add_argument("--self-test", action="store_true", help="check the installation (no window) and exit")
     args, qt_args = parser.parse_known_args(argv)
+
+    if args.self_test:
+        from self_test import run_self_test
+
+        return run_self_test(BASE_DIR, args.config)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = QApplication([sys.argv[0], *qt_args])

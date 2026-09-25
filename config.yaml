@@ -18,13 +18,15 @@ ado:
   verify_ssl: true
 
 bug:
-  work_item_type: "Bug"                  # Basic process projects use "Issue"
+  # Agile process: Bug = Title, Repro Steps, System Info, Found In, Severity, Priority,
+  # Area/Iteration, Assigned To, Tags. "Found In" is the .exe's ProductVersion.
+  work_item_type: "Bug"
   default_area_path: ""                  # e.g. "Your Project\\Order Entry" (empty = project root)
   default_iteration_path: ""             # e.g. "Your Project\\Sprint 42"
-  default_assigned_to: ""                # e.g. "dev.lead@company.com" (empty = team triage)
+  default_assigned_to: ""                # REQUIRED for your setup: e.g. "dev.lead@company.com"
   default_severity: "3 - Medium"
   tags: ["MAS-QA-Bridge"]
-  app_version: ""                        # override the version read from the .exe (e.g. CI build "2.4.0-rc3")
+  app_version: ""                        # leave empty: read from the .exe (matches the developers' build)
   include_machine_name: true             # add the tester's machine name to Environment
   extra_fields: {}                       # custom required fields, e.g. {"Custom.Team": "Checkout"}
 
@@ -34,6 +36,8 @@ app:
   window_title_contains: ""              # optional filter to skip splash screens
   window_find_timeout_seconds: 20
   embed_mode: "reparent"                 # reparent (SetParent) | dock (overlay)
+  run_as: "current"                      # current | admin | user (default of the "Run as" selector)
+  run_as_account: ""                     # e.g. "CONTOSO\\qa.tester2" pre-filled for "different user"
   on_exit: "release"                     # release | terminate
 
 evidence:

@@ -20,9 +20,15 @@ IS_WINDOWS = sys.platform == "win32"
 
 
 def get_file_version(path: Optional[str]) -> Optional[str]:
-    """Product/file version from a Windows executable's version resource."""
+    """The build developers know: ProductVersion, or the numeric FileVersion if absent."""
+    product, numeric = get_version_info(path)
+    return product or numeric
+
+
+def get_version_info(path: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(ProductVersion string, numeric FileVersion) from a Windows executable."""
     if not (IS_WINDOWS and path and os.path.isfile(path)):
-        return None
+        return None, None
     try:
         import win32api
 
@@ -37,11 +43,9 @@ def get_file_version(path: Optional[str]) -> Optional[str]:
             )
         except Exception:  # no string table - numeric version is enough
             pass
-        if product and product.strip() and product.strip() != numeric:
-            return f"{product.strip()} (file {numeric})"
-        return numeric
+        return (product.strip() if product and product.strip() else None), numeric
     except Exception:
-        return None
+        return None, None
 
 
 def os_description() -> str:
@@ -64,7 +68,10 @@ def collect_environment(
     env: dict[str, str] = {}
     if exe_path:
         env["Application"] = os.path.basename(exe_path)
-        env["Application version"] = app_version or get_file_version(exe_path) or "unknown"
+        product, numeric = get_version_info(exe_path)
+        env["Application version"] = app_version or product or numeric or "unknown"
+        if numeric and numeric != env["Application version"]:
+            env["File version"] = numeric
         env["Executable path"] = exe_path
     env["Operating system"] = os_description()
     if screen:

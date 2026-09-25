@@ -23,7 +23,6 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -31,6 +30,8 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import psutil
+
+import run_as
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -129,8 +130,9 @@ class WindowManager:
         self.poll_interval = poll_interval
 
         self.exe_path: Optional[str] = None
-        self.process: Optional[subprocess.Popen] = None
+        self.process: Optional[run_as.LaunchedProcess] = None
         self.pid: Optional[int] = None
+        self.run_as_label: str = ""
         self.hwnd: Optional[int] = None
         self.host_hwnd: Optional[int] = None
         self.mode: str = "reparent"
@@ -156,8 +158,10 @@ class WindowManager:
         exe_path: str,
         args: Optional[Sequence[str]] = None,
         cwd: Optional[str] = None,
+        run_as_mode: str = run_as.RUN_AS_CURRENT,
+        credentials: Optional[run_as.Credentials] = None,
     ) -> int:
-        """Start ``exe_path`` and return its PID."""
+        """Start ``exe_path`` (as the current user, elevated, or another user); return its PID."""
         _require_windows()
         if not os.path.isfile(exe_path):
             raise FileNotFoundError(exe_path)
@@ -166,13 +170,30 @@ class WindowManager:
         self.hwnd = None
         self._saved = None
         self._launch_time = time.time()
-        self.process = subprocess.Popen(
-            [self.exe_path, *(args or [])],
-            cwd=cwd or os.path.dirname(self.exe_path) or None,
+        self.process = run_as.launch(
+            self.exe_path,
+            list(args or []),
+            cwd or os.path.dirname(self.exe_path) or None,
+            run_as_mode,
+            credentials,
         )
         self.pid = self.process.pid
-        log.info("Launched %s (PID %s)", self.exe_path, self.pid)
+        self.run_as_label = self.process.run_as_label
+        log.info("Launched %s (PID %s) as %s", self.exe_path, self.pid, self.run_as_label)
         return self.pid
+
+    @property
+    def target_elevated(self) -> Optional[bool]:
+        return run_as.is_process_elevated(self.pid) if self.pid else None
+
+    def can_embed(self) -> tuple[bool, str]:
+        """UIPI check: a non-elevated dashboard cannot re-parent an elevated window."""
+        if self.target_elevated and not run_as.is_admin():
+            return False, (
+                "The application runs elevated (as administrator) but MAS-QA-Bridge does not. "
+                "Windows blocks embedding across that boundary - restart MAS-QA-Bridge as administrator."
+            )
+        return True, ""
 
     def candidate_pids(self) -> set[int]:
         """PIDs whose windows may belong to the launched app.
@@ -225,7 +246,7 @@ class WindowManager:
                 raise EmbedError("Window search cancelled.")
             pids = self.candidate_pids()
             if not pids:
-                code = self.process.poll() if self.process else None
+                code = run_as.handle_exit_code(self.process.handle) if self.process else None
                 raise EmbedError(f"Target process exited before showing a window (exit code {code}).")
             hwnd = self._best_window(pids, title_contains)
             if hwnd:
@@ -296,6 +317,9 @@ class WindowManager:
         hwnd = hwnd or self.hwnd
         if not hwnd or not win32gui.IsWindow(hwnd):
             raise EmbedError("Target window handle is not valid.")
+        allowed, reason = self.can_embed()
+        if not allowed:
+            raise EmbedError(reason)
         if self._saved is not None:
             self.release()
 
@@ -433,11 +457,20 @@ class WindowManager:
     def terminate(self, timeout: float = 5.0) -> None:
         """Kill the launched app (and its child processes)."""
         procs = self._live_processes()
+        denied = False
         for proc in procs:
             try:
                 proc.terminate()
+            except psutil.AccessDenied:
+                denied = True  # another user's / elevated process
             except psutil.Error:
                 pass
+        if denied and self.process is not None:
+            # The handle we got at launch has full access even across users.
+            try:
+                run_as.terminate_handle(self.process.handle)
+            except Exception as exc:
+                log.warning("Could not terminate PID %s: %s", self.pid, exc)
         _, alive = psutil.wait_procs(procs, timeout=timeout)
         for proc in alive:
             try:
@@ -449,3 +482,4 @@ class WindowManager:
         self.forget()
         self.process = None
         self.pid = None
+        self.run_as_label = ""

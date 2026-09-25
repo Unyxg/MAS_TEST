@@ -5,3 +5,7 @@ venv/
 temp_evidence/
 config.local.yaml
 .pytest_cache/
+smoke_out/
+dist/
+build/
+self_test.log
