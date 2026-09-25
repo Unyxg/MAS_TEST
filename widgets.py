@@ -5,7 +5,7 @@ widgets.py - Reusable UI building blocks for the MAS-QA-Bridge dashboard.
     TestExplorer   plan -> suite tree -> test points (left column)
     StepRunner     test case header + step cards with Pass/Fail/screenshot
     EvidencePanel  record / screenshot controls and captured evidence list
-    PublishPanel   outcome, comment, "file bug" and Publish button
+    PublishPanel   outcome, comment, bugs raised and Publish button
     StatusPill     small coloured status badge
 """
 from __future__ import annotations
@@ -16,7 +16,6 @@ from typing import Optional
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -281,6 +280,7 @@ class StepCard(QFrame):
     outcome_clicked = pyqtSignal(int, str)
     comment_edited = pyqtSignal(int, str)
     screenshot_clicked = pyqtSignal(int)
+    bug_clicked = pyqtSignal(int)
     activated = pyqtSignal(int)
 
     def __init__(self, index: int, number: int, action: str, expected: str, shared_title: Optional[str]) -> None:
@@ -314,8 +314,16 @@ class StepCard(QFrame):
         self.comment_edit = QLineEdit()
         self.comment_edit.setPlaceholderText("Actual result (why it failed)…")
         self.comment_edit.setVisible(False)
-        self.comment_edit.editingFinished.connect(lambda: self.comment_edited.emit(self.index, self.comment_edit.text()))
+        # textChanged (not editingFinished): a refresh must never wipe what the tester is typing.
+        self.comment_edit.textChanged.connect(lambda text: self.comment_edited.emit(self.index, text))
+        self.bug_btn = QPushButton("🐞 Report bug for this step")
+        self.bug_btn.setObjectName("bugLink")
+        self.bug_btn.setVisible(False)
+        self.bug_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bug_btn.clicked.connect(lambda: self.bug_clicked.emit(self.index))
+        self.comment_edit.setMinimumWidth(60)
         body.addWidget(self.comment_edit)
+        body.addWidget(self.bug_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         grid.addLayout(body, stretch=1)
 
         buttons = QVBoxLayout()
@@ -361,6 +369,7 @@ class StepCard(QFrame):
         self.pass_btn.setChecked(outcome == PASSED)
         self.fail_btn.setChecked(outcome == FAILED)
         self.comment_edit.setVisible(outcome == FAILED)
+        self.bug_btn.setVisible(outcome == FAILED)
         if comment != self.comment_edit.text():
             self.comment_edit.setText(comment)
         repolish(self)
@@ -377,6 +386,7 @@ class StepRunner(QFrame):
     step_outcome = pyqtSignal(int, str)
     step_comment = pyqtSignal(int, str)
     screenshot_requested = pyqtSignal(int)
+    bug_requested = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -450,6 +460,7 @@ class StepRunner(QFrame):
             card.outcome_clicked.connect(self.step_outcome)
             card.comment_edited.connect(self.step_comment)
             card.screenshot_clicked.connect(self.screenshot_requested)
+            card.bug_clicked.connect(self.bug_requested)
             card.activated.connect(self.set_current)
             self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
             self.cards.append(card)
@@ -534,6 +545,8 @@ class EvidencePanel(QFrame):
 
         self.list = QListWidget()
         self.list.setMinimumHeight(72)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.list.setToolTip("Checked items are attached when you publish. Double-click to open.")
         self.list.itemDoubleClicked.connect(lambda item: self.open_requested.emit(item.data(Qt.ItemDataRole.UserRole).path))
         self.list.itemChanged.connect(self._on_item_changed)
@@ -565,6 +578,7 @@ class EvidencePanel(QFrame):
 # ----------------------------------------------------------------------------
 class PublishPanel(QFrame):
     publish_requested = pyqtSignal()
+    bug_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -590,8 +604,17 @@ class PublishPanel(QFrame):
         self.comment_edit.setFixedHeight(54)
         layout.addWidget(self.comment_edit)
 
-        self.bug_chk = QCheckBox("Create bug in ADO when the result is Failed")
-        layout.addWidget(self.bug_chk)
+        bug_row = QHBoxLayout()
+        self.bug_btn = QPushButton("🐞 Report bug…")
+        self.bug_btn.setToolTip("Raise a bug for the development team (Ctrl+B)")
+        self.bug_btn.clicked.connect(self.bug_requested)
+        self.bugs_label = QLabel("")
+        self.bugs_label.setOpenExternalLinks(True)
+        self.bugs_label.setTextFormat(Qt.TextFormat.RichText)
+        self.bugs_label.setWordWrap(True)
+        bug_row.addWidget(self.bug_btn)
+        bug_row.addWidget(self.bugs_label, stretch=1)
+        layout.addLayout(bug_row)
 
         self.publish_btn = QPushButton("Publish to Azure DevOps   Ctrl+↵")
         self.publish_btn.setObjectName("publish")
@@ -615,7 +638,15 @@ class PublishPanel(QFrame):
         else:
             self.suggestion.setText("<span style='color:#9199a5'>● in progress</span>")
 
+    def show_bugs(self, bugs: list[dict]) -> None:
+        self.bugs_label.setText(
+            " ".join(f"<a style='color:#79b0ff' href='{b['url']}'>#{b['id']}</a>" for b in bugs)
+            if bugs
+            else "<span style='color:#9199a5'>no bugs raised</span>"
+        )
+
     def reset(self) -> None:
         self.outcome_combo.setCurrentIndex(0)
         self.comment_edit.clear()
         self.status.clear()
+        self.show_bugs([])

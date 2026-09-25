@@ -114,6 +114,19 @@ QLabel#pill[kind="info"] {{ background: #1b2d4d; color: #79b0ff; }}
 QProgressBar {{ background: {bg}; border: none; border-radius: 3px; max-height: 6px; }}
 QProgressBar::chunk {{ background: {pass}; border-radius: 3px; }}
 
+/* ---------- dialogs / tabs / tables ---------- */
+QDialog {{ background: {bg}; }}
+QLineEdit#bugTitle {{ font-size: 15px; font-weight: 600; padding: 8px 10px; }}
+QTabWidget::pane {{ border: 1px solid {border}; border-radius: 8px; background: {panel}; top: -1px; }}
+QTabBar::tab {{ background: transparent; color: {muted}; padding: 7px 14px; border: none; margin-right: 2px; }}
+QTabBar::tab:selected {{ color: {text}; border-bottom: 2px solid {accent}; }}
+QTabBar::tab:hover {{ color: {text}; }}
+QTableWidget {{ background: {bg}; border: 1px solid {border}; gridline-color: {border}; border-radius: 6px; }}
+QHeaderView::section {{ background: {panel_alt}; color: {muted}; border: none; padding: 5px; }}
+QTextBrowser {{ background: #fbfbfc; color: #1f2328; border: none; border-radius: 6px; padding: 10px; }}
+QPushButton#bugLink {{ background: transparent; border: 1px solid {fail}; color: #ff7b72; padding: 3px 8px; }}
+QPushButton#bugLink:hover {{ background: #42191a; }}
+
 QSplitter::handle {{ background: {bg}; }}
 QScrollArea {{ background: transparent; border: none; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}

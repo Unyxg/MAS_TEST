@@ -13,10 +13,20 @@ ado:
   attachment_api_version: "7.1-preview.1"
   attachment_target: "result"            # result | run | both
   step_attachments: true                 # step screenshots attach to that step
-  create_bug_on_fail: false              # default for the "Create bug" checkbox
   run_name_prefix: "MAS-QA-Bridge"
   timeout_seconds: 30
   verify_ssl: true
+
+bug:
+  work_item_type: "Bug"                  # Basic process projects use "Issue"
+  default_area_path: ""                  # e.g. "Your Project\\Order Entry" (empty = project root)
+  default_iteration_path: ""             # e.g. "Your Project\\Sprint 42"
+  default_assigned_to: ""                # e.g. "dev.lead@company.com" (empty = team triage)
+  default_severity: "3 - Medium"
+  tags: ["MAS-QA-Bridge"]
+  app_version: ""                        # override the version read from the .exe (e.g. CI build "2.4.0-rc3")
+  include_machine_name: true             # add the tester's machine name to Environment
+  extra_fields: {}                       # custom required fields, e.g. {"Custom.Team": "Checkout"}
 
 app:
   default_executable: ""                 # e.g. "C:/Program Files/MyApp/MyApp.exe"

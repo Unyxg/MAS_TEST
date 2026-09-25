@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ado_test_api import AdoConfig, AdoTestClient
+from ado_test_api import AdoConfig, AdoError, AdoTestClient
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +114,34 @@ SUITE_CASES = {203: [(4101, "passed"), (4102, "failed"), (4103, "unspecified"), 
                202: [(4201, "passed"), (4202, "unspecified")], 204: [(4301, "unspecified")], 201: [], 301: []}
 
 
+BUG_FIELDS = [
+    {"referenceName": "System.Title", "name": "Title", "alwaysRequired": True},
+    {"referenceName": "System.State", "name": "State", "alwaysRequired": True},
+    {"referenceName": "System.AreaPath", "name": "Area Path", "alwaysRequired": True},
+    {"referenceName": "System.IterationPath", "name": "Iteration Path", "alwaysRequired": True},
+    {"referenceName": "System.AssignedTo", "name": "Assigned To"},
+    {"referenceName": "System.Tags", "name": "Tags"},
+    {"referenceName": "Microsoft.VSTS.TCM.ReproSteps", "name": "Repro Steps"},
+    {"referenceName": "Microsoft.VSTS.TCM.SystemInfo", "name": "System Info"},
+    {"referenceName": "Microsoft.VSTS.Build.FoundIn", "name": "Found In"},
+    {"referenceName": "Microsoft.VSTS.Common.Priority", "name": "Priority", "allowedValues": ["1", "2", "3", "4"]},
+    {
+        "referenceName": "Microsoft.VSTS.Common.Severity",
+        "name": "Severity",
+        "allowedValues": ["1 - Critical", "2 - High", "3 - Medium", "4 - Low"],
+    },
+]
+AREAS = {
+    "name": "Orders Portal",
+    "children": [{"name": "Order Entry"}, {"name": "Reporting"}, {"name": "Security", "children": [{"name": "Login"}]}],
+}
+ITERATIONS = {
+    "name": "Orders Portal",
+    "children": [{"name": "Release 2.4", "children": [{"name": "Sprint 41"}, {"name": "Sprint 42"}]}, {"name": "Backlog"}],
+}
+SIMULATED_ERROR = "[simulate error]"
+
+
 class _FakeResponse:
     def __init__(self, payload: Any, headers: Optional[dict[str, str]] = None) -> None:
         self._payload = payload
@@ -181,7 +209,21 @@ class DemoAdoClient(AdoTestClient):
             return _FakeResponse({"id": "demo", "url": f"{self.project_url}/_apis/wit/attachments/demo"})
         if parts[-1] == "attachments":
             return _FakeResponse({"id": len(self.calls), "url": f"{self.project_url}/_apis/test/attachments/demo"})
+        if path == "wit/workitemtypes/Bug/fields":
+            return _FakeResponse({"value": BUG_FIELDS})
+        if path == "wit/classificationnodes/areas":
+            return _FakeResponse(AREAS)
+        if path == "wit/classificationnodes/iterations":
+            return _FakeResponse(ITERATIONS)
         if path == "wit/workitems/$Bug":
+            title = next((op["value"] for op in body if op["path"] == "/fields/System.Title"), "")
+            if SIMULATED_ERROR in title:
+                # What ADO returns when a process rule rejects a field value.
+                raise AdoError(
+                    "POST wit/workitems/$Bug -> HTTP 400: TF401320: Rule Error for field Area Path. "
+                    "Error code: Required, HasValues, LimitedToValues, AllowsOldValue, InvalidEmpty.",
+                    400,
+                )
             return _FakeResponse({"id": 8800 + len(self.calls)})
         return _FakeResponse({"value": []})
 

@@ -12,7 +12,7 @@ main_window.py - MAS-QA-Bridge dashboard (PyQt6).
 Run:  python main_window.py            (uses config.yaml + ADO_PAT)
       python main_window.py --demo     (offline demo with sample ADO data)
 
-Shortcuts: F5 pass step · F6 fail step · F7 screenshot · F9 record · Ctrl+Enter publish
+Shortcuts: F5 pass step · F6 fail step · F7 screenshot · F9 record · Ctrl+B report bug · Ctrl+Enter publish
 """
 from __future__ import annotations
 
@@ -46,8 +46,11 @@ from PyQt6.QtWidgets import (
 )
 
 from ado_test_api import AdoConfig, AdoTestClient
+from bug_dialog import BugDialog
+from bug_report import BugReport
 from evidence_capture import EvidenceRecorder, Region
 from qa_session import FAILED, PASSED, UNSPECIFIED, EvidenceItem, TestPoint, TestSession
+from system_info import collect_environment, get_file_version
 from theme import STYLESHEET
 from widgets import EvidencePanel, HostFrame, PublishPanel, StatusPill, StepRunner, TestExplorer
 from window_manager import IS_WINDOWS, EmbedError, WindowManager
@@ -130,6 +133,9 @@ class MainWindow(QMainWindow):
         self.app_cfg: dict[str, Any] = config.get("app") or {}
         self.ev_cfg: dict[str, Any] = config.get("evidence") or {}
         self.ado_cfg: dict[str, Any] = config.get("ado") or {}
+        self.bug_cfg: dict[str, Any] = config.get("bug") or {}
+        self.bug_meta: Optional[dict[str, Any]] = None  # severities, areas, iterations (loaded from ADO)
+        self._app_version: Optional[str] = None
 
         self.exe_path: Optional[str] = self.app_cfg.get("default_executable") or None
         self.pool = QThreadPool.globalInstance()
@@ -240,9 +246,10 @@ class MainWindow(QMainWindow):
         self.evidence_panel.open_folder_requested.connect(self.open_evidence_folder)
         default_format = str(self.ev_cfg.get("format", "GIF")).upper()
         self.evidence_panel.format_combo.setCurrentText(default_format if default_format in ("GIF", "MP4") else "GIF")
-        self.evidence_panel.setMaximumHeight(210)
+        self.evidence_panel.setMaximumHeight(180)
         self.publish_panel = PublishPanel()
-        self.publish_panel.bug_chk.setChecked(bool(self.ado_cfg.get("create_bug_on_fail", False)))
+        self.publish_panel.bug_requested.connect(lambda: self.open_bug_dialog())
+        self.runner.bug_requested.connect(self.open_bug_dialog)
         self.publish_panel.publish_requested.connect(self.publish)
         right_layout.addWidget(self.runner, stretch=1)
         right_layout.addWidget(self.evidence_panel)
@@ -320,11 +327,20 @@ class MainWindow(QMainWindow):
         self.rec_pill = StatusPill("", "idle")
         self.rec_pill.hide()
         self.ado_pill = StatusPill("ADO: not configured", "warn")
+        self.bug_btn = QPushButton("🐞 Report bug")
+        self.bug_btn.setObjectName("bugLink")
+        self.bug_btn.setToolTip("Raise a bug for the development team (Ctrl+B)")
+        self.bug_btn.clicked.connect(lambda: self.open_bug_dialog())
+        self.check_btn = QPushButton("Check ADO")
+        self.check_btn.setToolTip("Read-only checks: PAT, test plans, Bug fields, area/iteration paths")
+        self.check_btn.clicked.connect(self.run_diagnostics)
+        row.addWidget(self.bug_btn)
         self.log_btn = QPushButton("Log")
         self.log_btn.setCheckable(True)
         self.log_btn.toggled.connect(lambda on: self.log_dock.setVisible(on))
         row.addWidget(self.rec_pill)
         row.addWidget(self.ado_pill)
+        row.addWidget(self.check_btn)
         row.addWidget(self.log_btn)
         return header
 
@@ -345,6 +361,7 @@ class MainWindow(QMainWindow):
             "Ctrl+Return": self.publish,
             "Ctrl+Enter": self.publish,
             "Ctrl+L": lambda: self.log_btn.toggle(),
+            "Ctrl+B": lambda: self.open_bug_dialog(),
         }
         for keys, slot in bindings.items():
             shortcut = QShortcut(QKeySequence(keys), self)
@@ -386,6 +403,7 @@ class MainWindow(QMainWindow):
 
     def _set_exe_path(self, path: Optional[str]) -> None:
         self.exe_path = path
+        self._app_version = get_file_version(path)
         self.exe_label.setText(path or "No executable selected")
         self.exe_label.setToolTip(path or "")
         self.app_name.setText(os.path.basename(path) if path else ("Contoso Orders (demo)" if self.demo else "—"))
@@ -406,6 +424,9 @@ class MainWindow(QMainWindow):
         self.host_frame.placeholder.setVisible(not embedded and not self.demo)
         has_session = self.session is not None
         self.publish_panel.publish_btn.setEnabled(has_session and self.ado_client is not None)
+        self.publish_panel.bug_btn.setEnabled(self.ado_client is not None)
+        self.bug_btn.setEnabled(self.ado_client is not None)
+        self.check_btn.setEnabled(self.ado_client is not None)
         if embedded:
             self.app_state.set_state(f"{'Embedded' if wm.mode == 'reparent' else 'Docked'} · PID {wm.pid}", "ok")
         elif has_window:
@@ -539,6 +560,13 @@ class MainWindow(QMainWindow):
         if not plans:
             self.explorer.set_message("No active test plans in this project.")
         self.explorer.set_plans(plans, select_id=cfg.test_plan_id)
+        if self.bug_meta is None:
+            self._run_task(
+                self.ado_client.bug_metadata,
+                self.bug_work_item_type,
+                on_success=lambda meta: setattr(self, "bug_meta", meta),
+                on_error=lambda msg: log.warning("Bug form will use defaults - could not read bug metadata: %s", msg),
+            )
 
     def load_suites(self, plan_id: int) -> None:
         self.explorer.set_message("Loading suites…")
@@ -695,14 +723,26 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        if outcome == FAILED and not session.bugs:
+            box = QMessageBox(QMessageBox.Icon.Question, APP_NAME, "This test failed but no bug has been raised yet.", parent=self)
+            report_btn = box.addButton("Report bug first", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Publish without bug", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() is cancel_btn:
+                return
+            if box.clickedButton() is report_btn:
+                self.open_bug_dialog()
+                if not session.bugs:
+                    return  # bug form was cancelled
+
         comment = self.publish_panel.comment_edit.toPlainText().strip() or None
-        create_bug = self.publish_panel.bug_chk.isChecked()
         stop_recording = self.recorder.is_recording and bool(self.ev_cfg.get("auto_stop_on_publish", True))
 
         def job() -> dict[str, Any]:
             if stop_recording:
                 session.evidence.append(self._save_recording())
-            return self.ado_client.record_execution(session, outcome, comment, create_bug=create_bug)
+            return self.ado_client.record_execution(session, outcome, comment)
 
         self.publish_panel.publish_btn.setEnabled(False)
         self.publish_panel.status.setText(f"Publishing <b>{outcome}</b>…")
@@ -720,16 +760,129 @@ class MainWindow(QMainWindow):
         lines = [f"✔ <b>{report['outcome']}</b> published → <a style='color:#79b0ff' href='{report['url']}'>run #{report['run_id']}</a>"]
         if report["attachments"]:
             lines.append(f"{len(report['attachments'])} attachment(s) uploaded")
-        if report.get("bug"):
-            lines.append(f"🐞 <a style='color:#79b0ff' href='{report['bug']['url']}'>Bug #{report['bug']['id']}</a> created and linked")
-        if report.get("bug_error"):
-            lines.append(f"<span style='color:#ff7b72'>Bug not created: {report['bug_error']}</span>")
+        for bug in report.get("bugs", []):
+            lines.append(f"🐞 <a style='color:#79b0ff' href='{bug['url']}'>Bug #{bug['id']}</a> linked to this result")
         self.publish_panel.status.setText("<br>".join(lines))
         log.info("Published %s (run %s, result %s)", report["outcome"], report["run_id"], report["result_id"])
 
     def _on_publish_error(self, message: str) -> None:
         self.publish_panel.status.setText(f"<span style='color:#ff7b72'>✖ {message}</span>")
         self._show_error(message)
+
+    # ===================================================== bugs
+    @property
+    def bug_work_item_type(self) -> str:
+        return str(self.bug_cfg.get("work_item_type") or "Bug")
+
+    def _screen_description(self) -> str:
+        screen = self.screen()
+        if screen is None:
+            return ""
+        size, ratio = screen.size(), screen.devicePixelRatio()
+        return f"{round(size.width() * ratio)}×{round(size.height() * ratio)} @ {round(ratio * 100)}% scaling"
+
+    def _new_bug_report(self, step_index: Optional[int]) -> BugReport:
+        session = self.session
+        environment = collect_environment(
+            exe_path=self.exe_path,
+            app_version=self.bug_cfg.get("app_version") or self._app_version,
+            screen=self._screen_description(),
+            configuration=session.point.configuration if session else None,
+            include_machine_name=bool(self.bug_cfg.get("include_machine_name", True)),
+        )
+        found_in = str(self.bug_cfg.get("app_version") or self._app_version or "")
+        report = BugReport.from_session(session, step_index, environment, found_in)
+        if session is None:
+            report.attachments = [e.path for e in self.loose_evidence if e.attach and e.path.exists()]
+        report.area_path = str(self.bug_cfg.get("default_area_path") or "")
+        report.iteration_path = str(self.bug_cfg.get("default_iteration_path") or "")
+        report.assigned_to = str(self.bug_cfg.get("default_assigned_to") or "")
+        report.severity = str(self.bug_cfg.get("default_severity") or report.severity)
+        report.extra_fields = {str(k): str(v) for k, v in (self.bug_cfg.get("extra_fields") or {}).items()}
+        report.tags = list(dict.fromkeys([*(self.bug_cfg.get("tags") or ["MAS-QA-Bridge"]), *(
+            [session.point.configuration] if session and session.point.configuration else [])]))
+        return report
+
+    def open_bug_dialog(self, step_index: Optional[int] = None) -> None:
+        """Open the bug form, pre-filled from the current test (or blank for exploratory testing)."""
+        if self.ado_client is None:
+            QMessageBox.warning(self, APP_NAME, "Azure DevOps is not configured - see config.yaml.")
+            return
+        if self.session and step_index is not None:
+            self._on_step_comment(step_index, self.runner.cards[step_index].comment_edit.text())
+
+        dialog = BugDialog(self._new_bug_report(step_index), self.bug_meta, self.recorder.output_dir / "bug_drafts", self)
+
+        def on_screenshot() -> None:
+            dialog.hide()  # don't capture the form itself
+
+            def capture() -> None:
+                self._refresh_capture_region()
+                try:
+                    path = self.recorder.screenshot(self._evidence_name("bug"))
+                    self._add_evidence(EvidenceItem(path, "screenshot"))
+                    dialog.add_attachment(path)
+                except Exception as exc:
+                    log.error("Screenshot failed: %s", exc)
+                dialog.show()
+
+            QTimer.singleShot(350, capture)
+
+        def on_submit(report: BugReport) -> None:
+            self._run_task(
+                self.ado_client.create_bug,
+                report,
+                self.bug_work_item_type,
+                on_success=dialog.submission_succeeded,
+                on_error=dialog.submission_failed,
+            )
+
+        dialog.screenshot_requested.connect(on_screenshot)
+        dialog.submit_requested.connect(on_submit)
+        dialog.exec()
+        if dialog.created_bug:
+            self._on_bug_created(dialog.created_bug)
+
+    def _on_bug_created(self, bug: dict[str, Any]) -> None:
+        if self.session:
+            self.session.bugs.append(bug)
+            self.publish_panel.show_bugs(self.session.bugs)
+        skipped = f"<br><i>Skipped fields not in your process: {', '.join(bug['skipped_fields'])}</i>" if bug.get("skipped_fields") else ""
+        linked = " and linked to the test result" if self.session and self.session.result_id else ""
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"🐞 <b>Bug #{bug['id']}</b> created{linked}.<br><a style='color:#79b0ff' href='{bug['url']}'>{bug['title']}</a>"
+            f"<br>{len(bug.get('attachments', []))} attachment(s) uploaded.{skipped}"
+        )
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        box.exec()
+
+    def run_diagnostics(self) -> None:
+        if self.ado_client is None:
+            return
+        self.check_btn.setEnabled(False)
+        self.ado_pill.set_state("ADO: checking…", "warn")
+
+        def show(checks: list[tuple[str, bool, str]]) -> None:
+            ok = all(passed for _, passed, _ in checks)
+            self.ado_pill.set_state("ADO: ready" if ok else "ADO: problems", "ok" if ok else "err")
+            rows = "".join(
+                f"<tr><td>{'✅' if passed else '❌'}</td><td><b>{name}</b></td><td>{detail}</td></tr>" for name, passed, detail in checks
+            )
+            box = QMessageBox(self)
+            box.setWindowTitle("Azure DevOps check")
+            box.setTextFormat(Qt.TextFormat.RichText)
+            box.setText(f"<table cellpadding='4'>{rows}</table>")
+            box.exec()
+
+        self._run_task(
+            self.ado_client.run_diagnostics,
+            self.bug_work_item_type,
+            on_success=show,
+            on_finished=lambda: self.check_btn.setEnabled(True),
+        )
 
     # ============================================================ shutdown
     def closeEvent(self, event: QCloseEvent) -> None:

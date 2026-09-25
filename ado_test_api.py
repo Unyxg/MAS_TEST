@@ -18,7 +18,9 @@ Execute
     complete_test_run(run_id)           PATCH {project}/_apis/test/runs/{run}
 
 Defects
-    create_bug(...)                     POST  {project}/_apis/wit/workitems/$Bug
+    bug_metadata()                      GET   {project}/_apis/wit/workitemtypes/Bug/fields, classificationnodes
+    create_bug(report)                  POST  {project}/_apis/wit/workitems/$Bug  (+ wit/attachments)
+    run_diagnostics()                   read-only pre-flight checks
 
 ``record_execution`` chains these into the single "Publish" action of the UI and
 reports per-step outcomes the same way the web Test Runner does, so results show
@@ -30,7 +32,6 @@ import base64
 import json
 import logging
 import os
-import platform
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -38,12 +39,15 @@ from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 from urllib.parse import quote
 
 import requests
 
 from qa_session import FAILED, UNSPECIFIED, EvidenceItem, TestPoint, TestSession, TestStep
+
+if TYPE_CHECKING:
+    from bug_report import BugReport
 
 log = logging.getLogger(__name__)
 
@@ -220,6 +224,7 @@ class AdoTestClient:
         self.session.headers.update({"Accept": "application/json", "User-Agent": "MAS-QA-Bridge/2.0"})
         self.session.verify = config.verify_ssl
         self._shared_cache: dict[int, tuple[str, Optional[str]]] = {}
+        self._wit_fields_cache: dict[str, dict[str, dict[str, Any]]] = {}
 
     # ----------------------------------------------------------------- basics
     @property
@@ -537,8 +542,64 @@ class AdoTestClient:
         return data
 
     # ------------------------------------------------------------------ bugs
+    def get_work_item_type_fields(self, work_item_type: str = "Bug") -> dict[str, dict[str, Any]]:
+        """Fields of a work item type: ``{refName: {"name", "required", "allowed"}}`` (cached)."""
+        cache = self._wit_fields_cache
+        if work_item_type not in cache:
+            try:
+                data = self._request(
+                    "GET", f"wit/workitemtypes/{quote(work_item_type)}/fields", params={"$expand": "allowedValues"}
+                )
+            except AdoError as exc:
+                if exc.status_code == 404:
+                    raise AdoError(
+                        f"This project has no '{work_item_type}' work item type. Projects using the Basic "
+                        "process track defects as 'Issue' - set bug.work_item_type in config.yaml.",
+                        404,
+                    ) from exc
+                raise
+            cache[work_item_type] = {
+                f["referenceName"]: {
+                    "name": f.get("name", f["referenceName"]),
+                    "required": bool(f.get("alwaysRequired")),
+                    "allowed": [str(v) for v in (f.get("allowedValues") or [])],
+                }
+                for f in data.get("value", [])
+            }
+        return cache[work_item_type]
+
+    def list_classification_paths(self, group: str) -> list[str]:
+        """All area (``group="areas"``) or iteration (``"iterations"``) paths of the project."""
+        root = self._request("GET", f"wit/classificationnodes/{group}", params={"$depth": 10})
+        paths: list[str] = []
+
+        def walk(node: dict[str, Any], prefix: str) -> None:
+            path = f"{prefix}\\{node['name']}" if prefix else node["name"]
+            paths.append(path)
+            for child in node.get("children") or []:
+                walk(child, path)
+
+        walk(root, "")
+        return paths
+
+    def bug_metadata(self, work_item_type: str = "Bug") -> dict[str, Any]:
+        """Everything the bug form needs: severity values, areas, iterations, required fields."""
+        fields = self.get_work_item_type_fields(work_item_type)
+        severity = fields.get("Microsoft.VSTS.Common.Severity", {}).get("allowed") or []
+        return {
+            "work_item_type": work_item_type,
+            "severities": severity,
+            "areas": self.list_classification_paths("areas"),
+            "iterations": self.list_classification_paths("iterations"),
+            "required": sorted(m["name"] for m in fields.values() if m["required"]),
+            "fields": set(fields),
+        }
+
     def upload_work_item_attachment(self, file_path: str | Path) -> str:
         path = Path(file_path)
+        size = path.stat().st_size
+        if size > MAX_ATTACHMENT_BYTES:
+            raise AdoError(f"{path.name} is {size / 1e6:.1f} MB - over the attachment limit.")
         data = self._request(
             "POST",
             "wit/attachments",
@@ -548,45 +609,103 @@ class AdoTestClient:
         )
         return data["url"]
 
-    def create_bug(
-        self,
-        title: str,
-        repro_steps_html: str,
-        test_case_id: Optional[int] = None,
-        attachments: Iterable[str | Path] = (),
-    ) -> dict[str, Any]:
-        """Create a Bug linked to the test case ("Tested By") with evidence attached."""
+    def create_bug(self, report: "BugReport", work_item_type: str = "Bug") -> dict[str, Any]:
+        """Create a Bug from a ``BugReport``.
+
+        * evidence is uploaded first, screenshots are shown inline in Repro Steps
+        * linked to the test case ("Tested By") and to the test run (hyperlink)
+        * only fields that exist in this project's process are sent (Agile, Scrum
+          and CMMI differ); anything skipped is reported back as ``skipped_fields``
+        """
+        errors, _ = report.validate()
+        if errors:
+            raise AdoError("Bug is incomplete: " + " ".join(errors))
+        meta = self.get_work_item_type_fields(work_item_type)
+
+        media = {Path(p).name: self.upload_work_item_attachment(p) for p in report.attachments}
+        links = {}
+        if report.test_case_id:
+            links["test_case"] = self.work_item_web_url(report.test_case_id)
+        if report.run_id:
+            links["run"] = self.run_web_url(report.run_id)
+        repro = report.repro_html(media, links)
+
+        severity = report.severity
+        allowed = meta.get("Microsoft.VSTS.Common.Severity", {}).get("allowed") or []
+        if allowed and severity not in allowed:
+            # e.g. "2 - High" vs a customised list: match on the leading number.
+            severity = next((v for v in allowed if v[:1] == severity[:1]), allowed[len(allowed) // 2])
+
+        wanted: dict[str, Any] = {
+            "System.Title": report.title.strip(),
+            "Microsoft.VSTS.TCM.ReproSteps": repro,
+            "Microsoft.VSTS.TCM.SystemInfo": report.system_info_html(),
+            "Microsoft.VSTS.Common.Severity": severity,
+            "Microsoft.VSTS.Common.Priority": int(report.priority),
+            "Microsoft.VSTS.Build.FoundIn": report.found_in.strip(),
+            "System.AreaPath": report.area_path.strip(),
+            "System.IterationPath": report.iteration_path.strip(),
+            "System.AssignedTo": report.assigned_to.strip(),
+            "System.Tags": "; ".join(t.strip() for t in report.tags if t.strip()),
+            **report.extra_fields,
+        }
+        if "Microsoft.VSTS.TCM.ReproSteps" not in meta:  # e.g. customised processes
+            wanted["System.Description"] = wanted.pop("Microsoft.VSTS.TCM.ReproSteps")
+        skipped = [k for k, v in wanted.items() if v not in ("", None) and meta and k not in meta]
         ops: list[dict[str, Any]] = [
-            {"op": "add", "path": "/fields/System.Title", "value": title},
-            {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.ReproSteps", "value": repro_steps_html},
-            {
-                "op": "add",
-                "path": "/fields/Microsoft.VSTS.TCM.SystemInfo",
-                "value": f"{platform.platform()} · Python {platform.python_version()} · MAS-QA-Bridge",
-            },
+            {"op": "add", "path": f"/fields/{k}", "value": v}
+            for k, v in wanted.items()
+            if v not in ("", None) and (not meta or k in meta)
         ]
-        if test_case_id:
+        if report.test_case_id:
             ops.append(
                 {
                     "op": "add",
                     "path": "/relations/-",
                     "value": {
                         "rel": "Microsoft.VSTS.Common.TestedBy-Forward",
-                        "url": f"{self.org_url}/_apis/wit/workItems/{test_case_id}",
+                        "url": f"{self.org_url}/_apis/wit/workItems/{report.test_case_id}",
+                        "attributes": {"comment": "Found while executing this test case"},
                     },
                 }
             )
-        for file_path in attachments:
+        if links.get("run"):
             ops.append(
                 {
                     "op": "add",
                     "path": "/relations/-",
-                    "value": {"rel": "AttachedFile", "url": self.upload_work_item_attachment(file_path)},
+                    "value": {"rel": "Hyperlink", "url": links["run"], "attributes": {"comment": "Test run"}},
                 }
             )
-        bug = self._request("POST", "wit/workitems/$Bug", json_body=ops, content_type="application/json-patch+json")
-        log.info("Created bug %s", bug.get("id"))
-        return bug
+        for name, url in media.items():
+            ops.append(
+                {
+                    "op": "add",
+                    "path": "/relations/-",
+                    "value": {"rel": "AttachedFile", "url": url, "attributes": {"comment": f"Evidence: {name}"}},
+                }
+            )
+
+        bug = self._request(
+            "POST",
+            f"wit/workitems/${quote(work_item_type)}",
+            json_body=ops,
+            content_type="application/json-patch+json",
+        )
+        bug_id = int(bug["id"])
+        log.info("Created %s %s: %s", work_item_type, bug_id, report.title)
+        if skipped:
+            log.warning("Fields not in this project's %s type were skipped: %s", work_item_type, ", ".join(skipped))
+
+        if report.run_id and report.result_id:
+            self.associate_bug(report.run_id, report.result_id, bug_id)
+        return {
+            "id": bug_id,
+            "url": self.work_item_web_url(bug_id),
+            "title": report.title.strip(),
+            "skipped_fields": skipped,
+            "attachments": list(media),
+        }
 
     def associate_bug(self, run_id: int, result_id: int, bug_id: int) -> None:
         """Show the bug under the test result's 'Bugs' section (best effort)."""
@@ -598,6 +717,39 @@ class AdoTestClient:
             )
         except AdoError as exc:
             log.warning("Bug %s created but not associated with the result: %s", bug_id, exc)
+
+    # ------------------------------------------------------------ diagnostics
+    def run_diagnostics(self, work_item_type: str = "Bug") -> list[tuple[str, bool, str]]:
+        """Read-only pre-flight checks before using the app against a real project."""
+        checks: list[tuple[str, bool, str]] = []
+
+        def check(name: str, fn: Callable[[], str]) -> bool:
+            try:
+                checks.append((name, True, fn()))
+                return True
+            except Exception as exc:  # reported, not raised
+                checks.append((name, False, str(exc)))
+                return False
+
+        auth = lambda: (self.authenticate(), f"PAT accepted for {self.config.organization}/{self.config.project}")[1]  # noqa: E731
+        if not check("Authentication + test runs readable", auth):
+            return checks
+        check("Read test plans", lambda: f"{len(self.list_plans())} active plan(s)")
+        check(
+            f"'{work_item_type}' work item type",
+            lambda: f"{len(self.get_work_item_type_fields(work_item_type))} fields; required: "
+            + ", ".join(sorted(m['name'] for m in self.get_work_item_type_fields(work_item_type).values() if m['required'])),
+        )
+        check("Area paths", lambda: f"{len(self.list_classification_paths('areas'))} found")
+        check("Iteration paths", lambda: f"{len(self.list_classification_paths('iterations'))} found")
+        checks.append(
+            (
+                "Write access",
+                True,
+                "Not tested (read-only check). Needs 'Test Management: Read & write' and 'Work Items: Read & write'.",
+            )
+        )
+        return checks
 
     # ------------------------------------------------------------ orchestration
     def _upload_evidence(self, run_id: int, result_id: int, session: TestSession, comment: Optional[str]) -> list[str]:
@@ -621,16 +773,10 @@ class AdoTestClient:
             uploaded.append(item.path.name)
         return uploaded
 
-    def record_execution(
-        self,
-        session: TestSession,
-        outcome: str,
-        comment: Optional[str] = None,
-        create_bug: bool = False,
-        bug_title: Optional[str] = None,
-    ) -> dict[str, Any]:
-        """Publish a whole manual execution: run → evidence → step results → complete → bug.
+    def record_execution(self, session: TestSession, outcome: str, comment: Optional[str] = None) -> dict[str, Any]:
+        """Publish a whole manual execution: run → evidence → step results → complete.
 
+        Bugs already raised for this session are associated with the result.
         If anything fails before the run is completed, the run is aborted so no
         dangling "In progress" runs are left behind.
         """
@@ -660,29 +806,17 @@ class AdoTestClient:
             self.abort_test_run(run_id)
             raise
 
-        report: dict[str, Any] = {
+        session.run_id, session.result_id = run_id, result_id
+        for bug in session.bugs:
+            self.associate_bug(run_id, result_id, int(bug["id"]))
+        return {
             "run_id": run_id,
             "result_id": result_id,
             "outcome": outcome,
             "attachments": uploaded,
             "url": self.run_web_url(run_id),
-            "bug": None,
+            "bugs": list(session.bugs),
         }
-        if create_bug and outcome == FAILED:
-            # The run is already recorded; a bug failure must not undo it.
-            try:
-                bug = self.create_bug(
-                    bug_title or f"[TC{point.test_case_id}] {point.title} failed",
-                    session.repro_steps_html(comment),
-                    test_case_id=point.test_case_id,
-                    attachments=[e.path for e in session.attachments()],
-                )
-                self.associate_bug(run_id, result_id, int(bug["id"]))
-                report["bug"] = {"id": bug["id"], "url": self.work_item_web_url(int(bug["id"]))}
-            except AdoError as exc:
-                report["bug_error"] = str(exc)
-                log.error("Result published but bug creation failed: %s", exc)
-        return report
 
     def record_point_outcome(
         self,

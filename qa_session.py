@@ -7,7 +7,6 @@ captured along the way, and the timing that is reported back to Azure DevOps.
 """
 from __future__ import annotations
 
-import html
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +71,9 @@ class TestSession:
     steps: list[TestStep]
     evidence: list[EvidenceItem] = field(default_factory=list)
     started_at: datetime = field(default_factory=utc_now)
+    bugs: list[dict] = field(default_factory=list)  # {"id", "url", "title"} raised during this run
+    run_id: Optional[int] = None  # set once the result is published
+    result_id: Optional[int] = None
 
     # ---------------------------------------------------------------- progress
     @property
@@ -104,24 +106,3 @@ class TestSession:
 
     def attachments(self) -> list[EvidenceItem]:
         return [e for e in self.evidence if e.attach and e.path.exists()]
-
-    # ------------------------------------------------------------ bug report
-    def repro_steps_html(self, comment: Optional[str] = None) -> str:
-        """HTML for a Bug's Repro Steps field, built from the executed steps."""
-        rows = []
-        for s in self.steps:
-            colour = {"Passed": "#2e7d32", "Failed": "#c62828"}.get(s.outcome, "#757575")
-            note = f"<br><i>Actual: {html.escape(s.comment)}</i>" if s.comment else ""
-            rows.append(
-                f"<li>{html.escape(s.action)}"
-                + (f"<br><b>Expected:</b> {html.escape(s.expected)}" if s.expected else "")
-                + f"<br><span style='color:{colour}'><b>{s.outcome}</b></span>{note}</li>"
-            )
-        header = (
-            f"<p>Found while executing test case <b>#{self.point.test_case_id} "
-            f"{html.escape(self.point.title)}</b>"
-            + (f" ({html.escape(self.point.configuration)})" if self.point.configuration else "")
-            + " with MAS-QA-Bridge.</p>"
-        )
-        summary = f"<p>{html.escape(comment)}</p>" if comment else ""
-        return header + summary + "<ol>" + "".join(rows) + "</ol>"
