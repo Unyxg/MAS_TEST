@@ -140,6 +140,7 @@ It only sends fields that exist in your project's process (Agile, Scrum and CMMI
 
 | File | Role |
 |---|---|
+| `app.py` | Entry point of the packaged .exe: writes any startup failure to `mas_qa_bridge_crash.log`. |
 | `main_window.py` | Entry point. Builds the window and connects all the pieces. Slow work runs on background threads. |
 | `widgets.py` | UI parts: Test Explorer, Step Runner (step cards), Evidence panel, Result panel, host frame. |
 | `theme.py` | Dark theme stylesheet and colours for each outcome. |
