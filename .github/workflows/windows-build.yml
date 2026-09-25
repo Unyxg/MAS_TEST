@@ -27,7 +27,8 @@ jobs:
       - name: Create a throw-away local account for the run-as test
         shell: pwsh
         run: |
-          $pw = "Mq!" + [guid]::NewGuid().ToString("N").Substring(0, 14)
+          # net user prompts (Y/N) for passwords longer than 14 characters - keep it at 14.
+          $pw = "Mq!" + [guid]::NewGuid().ToString("N").Substring(0, 11)
           Write-Output "::add-mask::$pw"
           net user masqa_smoke $pw /add | Out-Null
           "SMOKE_USER=masqa_smoke" >> $env:GITHUB_ENV
