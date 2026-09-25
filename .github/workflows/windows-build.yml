@@ -51,11 +51,14 @@ jobs:
 
       - name: Self-test the packaged exe
         shell: pwsh
+        timeout-minutes: 3
         run: |
           $dist = "dist\MAS-QA-Bridge"
-          $p = Start-Process -FilePath "$dist\MAS-QA-Bridge.exe" -ArgumentList "--self-test" -Wait -PassThru
-          Get-Content "$dist\self_test.log"
-          Remove-Item "$dist\self_test.log"
+          $p = Start-Process -FilePath "$dist\MAS-QA-Bridge.exe" -ArgumentList "--self-test" -PassThru
+          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; Write-Output "self-test timed out" }
+          foreach ($f in "self_test.log", "mas_qa_bridge_crash.log") {
+            if (Test-Path "$dist\$f") { Write-Output "---- $f"; Get-Content "$dist\$f"; Remove-Item "$dist\$f" }
+          }
           if ($p.ExitCode -ne 0) { exit 1 }
 
       - name: Upload MAS-QA-Bridge (Windows)

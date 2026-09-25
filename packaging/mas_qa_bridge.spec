@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(SPECPATH).parent
 
 a = Analysis(
-    [str(ROOT / "main_window.py")],
+    [str(ROOT / "app.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[],
@@ -16,6 +16,7 @@ a = Analysis(
         "imageio.config.plugins",
         "imageio.config.extensions",
         # imported lazily inside functions
+        "main_window",
         "demo_data",
         "self_test",
         "win32cred",

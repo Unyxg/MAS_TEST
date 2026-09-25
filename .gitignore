@@ -9,3 +9,4 @@ smoke_out/
 dist/
 build/
 self_test.log
+mas_qa_bridge_crash.log
