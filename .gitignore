@@ -4,3 +4,4 @@ __pycache__/
 venv/
 temp_evidence/
 config.local.yaml
+.pytest_cache/

@@ -1,52 +1,55 @@
 """
 main_window.py - MAS-QA-Bridge dashboard (PyQt6).
 
-Layout
-    +-----------------------------------------------------------------+
-    | [Browse Executable...]  C:\\path\\to\\app.exe      [Launch & Embed] |
-    +-----------------------------------------------------+-----------+
-    |                                                     | Target app|
-    |          central QFrame  (hosts the external app)   | Evidence  |
-    |                                                     | ADO result|
-    |                                                     | Log       |
-    +-----------------------------------------------------+-----------+
+    ┌ header: brand · Browse · exe path · mode · Launch/Release/Stop · REC · ADO ┐
+    ├──────────────┬──────────────────────────────────────┬─────────────────────┤
+    │ Test         │  Application under test              │ Test runner (steps) │
+    │ Explorer     │  (external .exe embedded here)       │ Evidence            │
+    │ plan/suite/  │                                      │ Result + Publish    │
+    │ points       │                                      │                     │
+    └──────────────┴──────────────────────────────────────┴─────────────────────┘
 
-Run:  python main_window.py
+Run:  python main_window.py            (uses config.yaml + ADO_PAT)
+      python main_window.py --demo     (offline demo with sample ADO data)
+
+Shortcuts: F5 pass step · F6 fail step · F7 screenshot · F9 record · Ctrl+Enter publish
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
-from PyQt6.QtCore import QObject, QPoint, QRegularExpression, QRunnable, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QDesktopServices, QRegularExpressionValidator, QResizeEvent
+from PyQt6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QMoveEvent, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
+    QComboBox,
+    QDockWidget,
     QFileDialog,
-    QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSizePolicy,
-    QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from ado_test_api import AdoConfig, AdoTestClient
 from evidence_capture import EvidenceRecorder, Region
+from qa_session import FAILED, PASSED, UNSPECIFIED, EvidenceItem, TestPoint, TestSession
+from theme import STYLESHEET
+from widgets import EvidencePanel, HostFrame, PublishPanel, StatusPill, StepRunner, TestExplorer
 from window_manager import IS_WINDOWS, EmbedError, WindowManager
 
 if IS_WINDOWS:
@@ -55,6 +58,7 @@ if IS_WINDOWS:
 APP_NAME = "MAS-QA-Bridge"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
+MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock")]
 
 log = logging.getLogger(APP_NAME)
 
@@ -101,7 +105,7 @@ class _LogBridge(QObject):
 
 
 class QtLogHandler(logging.Handler):
-    """Forwards log records (from any thread) to a widget via a queued signal."""
+    """Forwards log records (from any thread) to widgets via a queued signal."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -116,45 +120,13 @@ class QtLogHandler(logging.Handler):
 
 
 # ----------------------------------------------------------------------------
-# Host frame
-# ----------------------------------------------------------------------------
-class HostFrame(QFrame):
-    """Central frame whose native HWND becomes the parent of the external app."""
-
-    resized = pyqtSignal()
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("hostFrame")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumSize(640, 480)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        # Give this frame (only) its own native window handle for SetParent.
-        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-
-        self.placeholder = QLabel(
-            "No application embedded.\n\nUse \"Browse Executable…\" then \"Launch & Embed\".", self
-        )
-        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.placeholder.setObjectName("placeholder")
-
-    def native_handle(self) -> int:
-        return int(self.winId())
-
-    def resizeEvent(self, event: QResizeEvent) -> None:
-        super().resizeEvent(event)
-        self.placeholder.setGeometry(self.rect())
-        self.resized.emit()
-
-
-# ----------------------------------------------------------------------------
 # Main window
 # ----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], ado_client: Optional[AdoTestClient] = None, demo: bool = False) -> None:
         super().__init__()
         self.config = config
+        self.demo = demo
         self.app_cfg: dict[str, Any] = config.get("app") or {}
         self.ev_cfg: dict[str, Any] = config.get("evidence") or {}
         self.ado_cfg: dict[str, Any] = config.get("ado") or {}
@@ -178,182 +150,214 @@ class MainWindow(QMainWindow):
             jpeg_quality=int(self.ev_cfg.get("jpeg_quality", 90)),
             memory_budget_mb=int(self.ev_cfg.get("memory_budget_mb", 512)),
         )
-        self.last_evidence: Optional[Path] = None
-        self.ado_client: Optional[AdoTestClient] = None
+
+        self.session: Optional[TestSession] = None
+        self.session_published = False
+        self.loose_evidence: list[EvidenceItem] = []  # captured before a test was selected
+        self._recording_step: Optional[int] = None
 
         self._build_ui()
         self._install_log_handler()
-        self.ado_client = self._build_ado_client()
+        self._install_shortcuts()
+        self.ado_client = ado_client or self._build_ado_client()
 
-        # Keep the capture rectangle current (read by the recorder thread).
         self._region_timer = QTimer(self)
         self._region_timer.setInterval(200)
         self._region_timer.timeout.connect(self._refresh_capture_region)
         self._region_timer.start()
 
-        # Notice when the embedded app closes itself; tick the recording clock.
         self._watchdog = QTimer(self)
-        self._watchdog.setInterval(1000)
+        self._watchdog.setInterval(500)
         self._watchdog.timeout.connect(self._on_watchdog)
         self._watchdog.start()
 
         self._set_exe_path(self.exe_path)
         self._update_controls()
+        if self.ado_client is not None:
+            QTimer.singleShot(0, self.load_plans)
 
     # ================================================================== UI
     def _build_ui(self) -> None:
-        self.setWindowTitle(APP_NAME)
-        self.resize(1600, 950)
-
-        central = QWidget(self)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-
-        # ---- top bar
-        top = QHBoxLayout()
-        self.browse_btn = QPushButton("Browse Executable…")
-        self.browse_btn.clicked.connect(self.browse_executable)
-        self.exe_label = QLabel()
-        self.exe_label.setObjectName("exeLabel")
-        self.exe_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.exe_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.launch_btn = QPushButton("Launch && Embed")
-        self.launch_btn.setObjectName("primary")
-        self.launch_btn.clicked.connect(self.launch_and_embed)
-        top.addWidget(self.browse_btn)
-        top.addWidget(self.exe_label, stretch=1)
-        top.addWidget(self.launch_btn)
-        root.addLayout(top)
-
-        # ---- body: host frame + sidebar
-        body = QHBoxLayout()
-        self.host_frame = HostFrame(central)
-        self.host_frame.resized.connect(self._on_host_resized)
-        body.addWidget(self.host_frame, stretch=1)
-        body.addWidget(self._build_sidebar())
-        root.addLayout(body, stretch=1)
-
-        self.setCentralWidget(central)
-        self.statusBar().showMessage("Ready")
+        self.setWindowTitle(APP_NAME + (" — DEMO" if self.demo else ""))
+        self.resize(1680, 980)
         self.setStyleSheet(STYLESHEET)
 
-    def _build_sidebar(self) -> QWidget:
-        sidebar = QWidget()
-        sidebar.setFixedWidth(360)
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(0, 0, 0, 0)
+        root = QWidget()
+        root.setObjectName("root")
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._build_header())
 
-        # ---- target app
-        app_box = QGroupBox("Target Application")
-        app_layout = QHBoxLayout(app_box)
-        self.release_btn = QPushButton("Release")
-        self.release_btn.setToolTip("Un-embed the window back to the desktop")
-        self.release_btn.clicked.connect(self.release_window)
-        self.reembed_btn = QPushButton("Re-embed")
-        self.reembed_btn.clicked.connect(self.reembed_window)
-        self.kill_btn = QPushButton("Terminate")
-        self.kill_btn.clicked.connect(self.terminate_app)
-        for btn in (self.release_btn, self.reembed_btn, self.kill_btn):
-            app_layout.addWidget(btn)
-        layout.addWidget(app_box)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(8)
+        splitter.setChildrenCollapsible(False)
+        splitter.splitterMoved.connect(lambda *_: self._on_host_resized())
 
-        # ---- evidence
-        ev_box = QGroupBox("Evidence Capture")
-        ev_layout = QVBoxLayout(ev_box)
-        form = QFormLayout()
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(1, 30)
-        self.fps_spin.setValue(self.recorder.fps)
-        form.addRow("Frames / sec", self.fps_spin)
-        ev_layout.addLayout(form)
-        rec_row = QHBoxLayout()
-        self.rec_start_btn = QPushButton("● Start Recording")
-        self.rec_start_btn.setObjectName("record")
-        self.rec_start_btn.clicked.connect(self.start_recording)
-        self.rec_stop_btn = QPushButton("■ Stop && Save GIF")
-        self.rec_stop_btn.clicked.connect(self.stop_recording)
-        rec_row.addWidget(self.rec_start_btn)
-        rec_row.addWidget(self.rec_stop_btn)
-        ev_layout.addLayout(rec_row)
-        self.rec_status = QLabel("Idle")
-        self.evidence_label = QLabel("No evidence yet")
-        self.evidence_label.setWordWrap(True)
-        self.open_folder_btn = QPushButton("Open Evidence Folder")
-        self.open_folder_btn.clicked.connect(self.open_evidence_folder)
-        ev_layout.addWidget(self.rec_status)
-        ev_layout.addWidget(self.evidence_label)
-        ev_layout.addWidget(self.open_folder_btn)
-        layout.addWidget(ev_box)
+        # left: test explorer
+        self.explorer = TestExplorer()
+        self.explorer.setMinimumWidth(250)
+        self.explorer.plan_selected.connect(self.load_suites)
+        self.explorer.suite_selected.connect(self.load_points)
+        self.explorer.point_selected.connect(self.open_point)
+        self.explorer.refresh_requested.connect(self.load_plans)
+        splitter.addWidget(self.explorer)
 
-        # ---- ADO
-        ado_box = QGroupBox("Azure DevOps Test Plans")
-        ado_layout = QVBoxLayout(ado_box)
-        ado_form = QFormLayout()
-        digits = QRegularExpressionValidator(QRegularExpression(r"\d{1,10}"))
-        self.plan_edit = QLineEdit(str(self.ado_cfg.get("test_plan_id") or ""))
-        self.plan_edit.setValidator(digits)
-        self.point_edit = QLineEdit()
-        self.point_edit.setValidator(digits)
-        self.point_edit.setPlaceholderText("e.g. 1234")
-        ado_form.addRow("Test Plan ID", self.plan_edit)
-        ado_form.addRow("Test Point ID", self.point_edit)
-        ado_layout.addLayout(ado_form)
-        self.comment_edit = QPlainTextEdit()
-        self.comment_edit.setPlaceholderText("Result comment / defect notes…")
-        self.comment_edit.setFixedHeight(70)
-        ado_layout.addWidget(self.comment_edit)
-        self.attach_chk = QCheckBox("Attach evidence (GIF)")
-        self.attach_chk.setChecked(True)
-        ado_layout.addWidget(self.attach_chk)
+        # centre: application under test
+        centre = QWidget()
+        centre_layout = QVBoxLayout(centre)
+        centre_layout.setContentsMargins(0, 0, 0, 0)
+        centre_layout.setSpacing(6)
+        strip = QHBoxLayout()
+        caption = QLabel("APPLICATION UNDER TEST")
+        caption.setObjectName("panelTitle")
+        self.app_name = QLabel("—")
+        self.app_state = StatusPill("Not running", "idle")
+        strip.addWidget(caption)
+        strip.addWidget(self.app_name)
+        strip.addStretch()
+        strip.addWidget(self.app_state)
+        centre_layout.addLayout(strip)
+        self.host_frame = HostFrame()
+        self.host_frame.resized.connect(self._on_host_resized)
+        centre_layout.addWidget(self.host_frame, stretch=1)
+        splitter.addWidget(centre)
 
-        verdict_row = QHBoxLayout()
-        self.pass_btn = QPushButton("✔ Pass")
-        self.pass_btn.setObjectName("pass")
-        self.pass_btn.clicked.connect(lambda: self.submit_verdict("Passed"))
-        self.fail_btn = QPushButton("✖ Fail")
-        self.fail_btn.setObjectName("fail")
-        self.fail_btn.clicked.connect(lambda: self.submit_verdict("Failed"))
-        self.blocked_btn = QPushButton("Blocked")
-        self.blocked_btn.clicked.connect(lambda: self.submit_verdict("Blocked"))
-        for btn in (self.pass_btn, self.fail_btn, self.blocked_btn):
-            verdict_row.addWidget(btn)
-        ado_layout.addLayout(verdict_row)
+        # right: runner, evidence, result
+        right = QWidget()
+        right.setMinimumWidth(380)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        self.runner = StepRunner()
+        self.runner.step_outcome.connect(self.set_step_outcome)
+        self.runner.step_comment.connect(self._on_step_comment)
+        self.runner.screenshot_requested.connect(self.take_screenshot)
+        self.evidence_panel = EvidencePanel()
+        self.evidence_panel.record_toggled.connect(self.toggle_recording)
+        self.evidence_panel.screenshot_requested.connect(lambda: self.take_screenshot(self.runner.current))
+        self.evidence_panel.open_requested.connect(lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))))
+        self.evidence_panel.open_folder_requested.connect(self.open_evidence_folder)
+        default_format = str(self.ev_cfg.get("format", "GIF")).upper()
+        self.evidence_panel.format_combo.setCurrentText(default_format if default_format in ("GIF", "MP4") else "GIF")
+        self.evidence_panel.setMaximumHeight(210)
+        self.publish_panel = PublishPanel()
+        self.publish_panel.bug_chk.setChecked(bool(self.ado_cfg.get("create_bug_on_fail", False)))
+        self.publish_panel.publish_requested.connect(self.publish)
+        right_layout.addWidget(self.runner, stretch=1)
+        right_layout.addWidget(self.evidence_panel)
+        right_layout.addWidget(self.publish_panel)
+        splitter.addWidget(right)
 
-        self.test_conn_btn = QPushButton("Test ADO Connection")
-        self.test_conn_btn.clicked.connect(self.test_ado_connection)
-        ado_layout.addWidget(self.test_conn_btn)
-        self.ado_status = QLabel("Not connected")
-        self.ado_status.setWordWrap(True)
-        self.ado_status.setOpenExternalLinks(True)
-        self.ado_status.setTextFormat(Qt.TextFormat.RichText)
-        ado_layout.addWidget(self.ado_status)
-        layout.addWidget(ado_box)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([290, 960, 420])
 
-        # ---- log
-        log_box = QGroupBox("Log")
-        log_layout = QVBoxLayout(log_box)
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(10, 10, 10, 10)
+        body_layout.addWidget(splitter)
+        outer.addWidget(body, stretch=1)
+        self.setCentralWidget(root)
+
+        # log dock (toggle from the header)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
-        log_layout.addWidget(self.log_view)
-        layout.addWidget(log_box, stretch=1)
-        return sidebar
+        self.log_view.setMaximumBlockCount(3000)
+        self.log_dock = QDockWidget("Log", self)
+        self.log_dock.setWidget(self.log_view)
+        self.log_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+        self.log_dock.visibilityChanged.connect(lambda _v: QTimer.singleShot(0, self._on_host_resized))
+
+        self.statusBar().showMessage("Ready")
+
+    def _build_header(self) -> QFrame:
+        header = QFrame()
+        header.setObjectName("header")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(8)
+
+        brand = QLabel("MAS-QA")
+        brand.setObjectName("brand")
+        accent = QLabel("Bridge")
+        accent.setObjectName("brandAccent")
+        row.addWidget(brand)
+        row.addWidget(accent)
+        row.addSpacing(16)
+
+        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn.setToolTip("Select the executable under test")
+        self.browse_btn.clicked.connect(self.browse_executable)
+        self.exe_label = QLabel()
+        self.exe_label.setObjectName("exePath")
+        self.exe_label.setMinimumWidth(260)
+        self.mode_combo = QComboBox()
+        for label, mode in MODES:
+            self.mode_combo.addItem(label, mode)
+        configured = str(self.app_cfg.get("embed_mode", "reparent"))
+        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(configured)))
+        self.mode_combo.setToolTip(
+            "Embed: true child window (SetParent).\nDock: borderless window glued over the frame - "
+            "use for apps that misbehave when re-parented (Electron, some WPF)."
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.launch_btn = QPushButton("▶ Launch")
+        self.launch_btn.setObjectName("primary")
+        self.launch_btn.clicked.connect(self.launch_and_embed)
+        self.release_btn = QPushButton("Pop out")
+        self.release_btn.setToolTip("Give the window back to the desktop / re-embed it")
+        self.release_btn.clicked.connect(self.toggle_release)
+        self.kill_btn = QPushButton("■ Stop app")
+        self.kill_btn.clicked.connect(self.terminate_app)
+        for widget in (self.browse_btn, self.exe_label, self.mode_combo, self.launch_btn, self.release_btn, self.kill_btn):
+            row.addWidget(widget, stretch=1 if widget is self.exe_label else 0)
+
+        row.addSpacing(12)
+        self.rec_pill = StatusPill("", "idle")
+        self.rec_pill.hide()
+        self.ado_pill = StatusPill("ADO: not configured", "warn")
+        self.log_btn = QPushButton("Log")
+        self.log_btn.setCheckable(True)
+        self.log_btn.toggled.connect(lambda on: self.log_dock.setVisible(on))
+        row.addWidget(self.rec_pill)
+        row.addWidget(self.ado_pill)
+        row.addWidget(self.log_btn)
+        return header
 
     def _install_log_handler(self) -> None:
         handler = QtLogHandler()
         handler.setLevel(logging.INFO)
         handler.bridge.message.connect(self.log_view.appendPlainText)
+        handler.bridge.message.connect(lambda m: self.statusBar().showMessage(m.split("  ", 1)[-1], 8000))
         logging.getLogger().addHandler(handler)
         self._log_handler = handler
+
+    def _install_shortcuts(self) -> None:
+        bindings = {
+            "F5": lambda: self._shortcut_step(PASSED),
+            "F6": lambda: self._shortcut_step(FAILED),
+            "F7": lambda: self.take_screenshot(self.runner.current),
+            "F9": self.toggle_recording,
+            "Ctrl+Return": self.publish,
+            "Ctrl+Enter": self.publish,
+            "Ctrl+L": lambda: self.log_btn.toggle(),
+        }
+        for keys, slot in bindings.items():
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(slot)
 
     def _build_ado_client(self) -> Optional[AdoTestClient]:
         try:
             client = AdoTestClient(AdoConfig.from_dict(self.ado_cfg))
         except ValueError as exc:
             log.warning("ADO integration disabled: %s", exc)
-            self.ado_status.setText(f"<i>ADO disabled - {exc}. Edit config.yaml.</i>")
+            self.explorer.set_message(f"Azure DevOps is not configured.<br><i>{exc}</i><br>Edit config.yaml and set ADO_PAT.")
             return None
-        self.ado_status.setText(f"Configured for <b>{client.config.organization}/{client.config.project}</b>")
         return client
 
     # ============================================================ helpers
@@ -384,25 +388,32 @@ class MainWindow(QMainWindow):
         self.exe_path = path
         self.exe_label.setText(path or "No executable selected")
         self.exe_label.setToolTip(path or "")
+        self.app_name.setText(os.path.basename(path) if path else ("Contoso Orders (demo)" if self.demo else "—"))
         self._update_controls()
+
+    @property
+    def embed_mode(self) -> str:
+        return self.mode_combo.currentData()
 
     def _update_controls(self) -> None:
         wm = self.window_manager
         embedded = wm.is_embedded
         has_window = wm.window_exists()
-        recording = self.recorder.is_recording
         self.launch_btn.setEnabled(bool(self.exe_path) and IS_WINDOWS)
-        self.release_btn.setEnabled(embedded)
-        self.reembed_btn.setEnabled(has_window and not embedded)
+        self.release_btn.setEnabled(has_window)
+        self.release_btn.setText("Pop out" if embedded or not has_window else "Re-embed")
         self.kill_btn.setEnabled(wm.pid is not None)
-        self.rec_start_btn.setEnabled(not recording)
-        self.rec_stop_btn.setEnabled(recording)
-        self.fps_spin.setEnabled(not recording)
-        self.host_frame.placeholder.setVisible(not embedded)
-
-    def _set_verdict_busy(self, busy: bool) -> None:
-        for btn in (self.pass_btn, self.fail_btn, self.blocked_btn, self.test_conn_btn):
-            btn.setEnabled(not busy)
+        self.host_frame.placeholder.setVisible(not embedded and not self.demo)
+        has_session = self.session is not None
+        self.publish_panel.publish_btn.setEnabled(has_session and self.ado_client is not None)
+        if embedded:
+            self.app_state.set_state(f"{'Embedded' if wm.mode == 'reparent' else 'Docked'} · PID {wm.pid}", "ok")
+        elif has_window:
+            self.app_state.set_state(f"Popped out · PID {wm.pid}", "info")
+        elif wm.pid is not None:
+            self.app_state.set_state("Starting…", "warn")
+        else:
+            self.app_state.set_state("Demo app" if self.demo else "Not running", "info" if self.demo else "idle")
 
     def _refresh_capture_region(self) -> None:
         """Compute the host frame's rectangle in physical screen pixels."""
@@ -426,7 +437,7 @@ class MainWindow(QMainWindow):
             }
         self._capture_region = region
 
-    # ======================================================= step 1 / 2
+    # ================================================== application under test
     def browse_executable(self) -> None:
         start_dir = os.path.dirname(self.exe_path) if self.exe_path else os.path.expanduser("~")
         path, _ = QFileDialog.getOpenFileName(
@@ -444,11 +455,8 @@ class MainWindow(QMainWindow):
             self.browse_executable()
             if not self.exe_path:
                 return
-
         if self.window_manager.pid is not None and self.window_manager.is_running:
-            answer = QMessageBox.question(
-                self, APP_NAME, "An application is already running. Terminate it and launch the new one?"
-            )
+            answer = QMessageBox.question(self, APP_NAME, "An application is already running. Stop it and launch again?")
             if answer != QMessageBox.StandardButton.Yes:
                 return
             self.window_manager.terminate()
@@ -460,167 +468,276 @@ class MainWindow(QMainWindow):
             return
 
         self.launch_btn.setEnabled(False)
-        self.statusBar().showMessage("Waiting for the application window…")
+        self._update_controls()
         self._run_task(
             self.window_manager.find_window,
             title_contains=self.app_cfg.get("window_title_contains") or None,
-            on_success=self._embed_found_window,
+            on_success=self._embed_window,
             on_finished=self._update_controls,
         )
 
-    def _embed_found_window(self, hwnd: int) -> None:
+    def _embed_window(self, hwnd: Optional[int] = None) -> None:
         try:
-            self.window_manager.embed(self.host_frame.native_handle(), hwnd)
+            self.window_manager.embed(
+                self.host_frame.native_handle(),
+                hwnd or self.window_manager.hwnd,
+                mode=self.embed_mode,
+                owner_hwnd=int(self.winId()),
+            )
         except EmbedError as exc:
             self._show_error(str(exc))
-            return
-        self.statusBar().showMessage(f"Embedded: {os.path.basename(self.exe_path or '')}")
         self._update_controls()
 
-    def release_window(self) -> None:
-        self.window_manager.release()
-        self.statusBar().showMessage("Window released to desktop")
+    def toggle_release(self) -> None:
+        if self.window_manager.is_embedded:
+            self.window_manager.release()
+        elif self.window_manager.window_exists():
+            self._embed_window()
         self._update_controls()
 
-    def reembed_window(self) -> None:
-        self._embed_found_window(self.window_manager.hwnd)
+    def _on_mode_changed(self) -> None:
+        if self.window_manager.is_embedded:
+            self._embed_window()  # re-embed in the new mode
 
     def terminate_app(self) -> None:
         self.window_manager.terminate()
-        self.statusBar().showMessage("Application terminated")
         self._update_controls()
 
     def _on_host_resized(self) -> None:
         self.window_manager.fit_to_host()
         self._refresh_capture_region()
 
+    def moveEvent(self, event: QMoveEvent) -> None:  # keeps a docked window glued to the frame
+        super().moveEvent(event)
+        if self.window_manager.mode == "dock":
+            self.window_manager.fit_to_host()
+
     def _on_watchdog(self) -> None:
         wm = self.window_manager
         if wm.hwnd and not wm.window_exists():
-            log.info("Embedded application window was closed")
+            log.info("Application window was closed")
             wm.forget()
-            self.statusBar().showMessage("Application closed")
+            wm.pid = None
+            self._update_controls()
         if self.recorder.is_recording:
-            self.rec_status.setText(
-                f"<span style='color:#d9534f'>● REC</span>  {self.recorder.elapsed:5.1f}s  "
-                f"({self.recorder.frame_count} frames)"
+            text = f"{int(self.recorder.elapsed // 60):02d}:{int(self.recorder.elapsed % 60):02d}"
+            self.rec_pill.set_state(f"● REC {text}", "rec")
+            self.rec_pill.show()
+            self.evidence_panel.set_recording(True, text)
+        elif self.rec_pill.isVisible() and self.rec_pill.property("kind") == "rec":
+            # Capture stopped by itself (max length reached) - save what we have.
+            self.stop_recording()
+
+    # ===================================================== ADO: browse
+    def load_plans(self) -> None:
+        self.ado_pill.set_state("ADO: connecting…", "warn")
+        self._run_task(self.ado_client.list_plans, on_success=self._on_plans, on_error=self._on_ado_error)
+
+    def _on_plans(self, plans: list[dict]) -> None:
+        cfg = self.ado_client.config
+        self.ado_pill.set_state(f"ADO: {cfg.organization}/{cfg.project}" + (" (demo)" if self.demo else ""), "ok")
+        if not plans:
+            self.explorer.set_message("No active test plans in this project.")
+        self.explorer.set_plans(plans, select_id=cfg.test_plan_id)
+
+    def load_suites(self, plan_id: int) -> None:
+        self.explorer.set_message("Loading suites…")
+        self._run_task(
+            self.ado_client.list_suites,
+            plan_id,
+            on_success=lambda suites: self.explorer.set_suites(plan_id, suites),
+            on_error=self._on_ado_error,
+        )
+
+    def load_points(self, plan_id: int, suite_id: int) -> None:
+        self.explorer.set_message("Loading test points…")
+        self._run_task(
+            self.ado_client.list_points, plan_id, suite_id, on_success=self.explorer.set_points, on_error=self._on_ado_error
+        )
+
+    def open_point(self, point: TestPoint) -> None:
+        if self.session and self.session.point.id == point.id:
+            return
+        if self._session_dirty():
+            answer = QMessageBox.question(
+                self, APP_NAME, f"Discard the unpublished results for TC {self.session.point.test_case_id}?"
             )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.explorer.select_point(self.session.point.id)
+                return
+        self.statusBar().showMessage(f"Loading steps for TC {point.test_case_id}…")
+        self._run_task(self.ado_client.load_session, point, on_success=self._on_session_loaded, on_error=self._on_ado_error)
+
+    def _on_session_loaded(self, session: TestSession) -> None:
+        carried = self.loose_evidence if self.session is None else []
+        self.session = session
+        self.session.evidence.extend(carried)
+        self.loose_evidence = []
+        self.session_published = False
+        self.runner.load(session)
+        self.publish_panel.reset()
+        self._refresh_session_views()
+        log.info("Loaded TC %s '%s' (%d steps)", session.point.test_case_id, session.point.title, len(session.steps))
+
+    def _session_dirty(self) -> bool:
+        return bool(self.session and not self.session_published and (self.session.done_count or self.session.evidence))
+
+    def _on_ado_error(self, message: str) -> None:
+        self.ado_pill.set_state("ADO: error", "err")
+        self._show_error(message)
+
+    # ===================================================== steps
+    def set_step_outcome(self, index: int, outcome: str) -> None:
+        if not self.session or not (0 <= index < len(self.session.steps)):
+            return
+        self.session.set_step_outcome(index, outcome)
+        self.runner.set_current(index)
+        self._refresh_session_views()
+        if outcome == PASSED:
+            self.runner.advance()
+        elif outcome == FAILED:
+            self.runner.cards[index].comment_edit.setFocus()
+
+    def _on_step_comment(self, index: int, text: str) -> None:
+        if self.session and 0 <= index < len(self.session.steps):
+            self.session.steps[index].comment = text.strip()
+
+    def _shortcut_step(self, outcome: str) -> None:
+        if self.session and self.runner.current >= 0:
+            self.set_step_outcome(self.runner.current, outcome)
+
+    def _refresh_session_views(self) -> None:
+        self.runner.refresh()
+        items = self.session.evidence if self.session else self.loose_evidence
+        self.evidence_panel.set_items(items)
+        self.publish_panel.show_suggestion(self.session.suggested_outcome() if self.session else None)
         self._update_controls()
 
-    # ============================================================= step 3
-    def start_recording(self) -> None:
+    # ===================================================== evidence
+    def _evidence_name(self, suffix: str) -> str:
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        if self.session:
+            return f"TC{self.session.point.test_case_id}_{suffix}_{stamp}"
+        return f"{suffix}_{stamp}"
+
+    def _add_evidence(self, item: EvidenceItem) -> None:
+        (self.session.evidence if self.session else self.loose_evidence).append(item)
+        self._refresh_session_views()
+
+    def _step_ref(self, index: Optional[int]) -> tuple[Optional[int], Optional[str]]:
+        if self.session and index is not None and 0 <= index < len(self.session.steps):
+            step = self.session.steps[index]
+            return step.number, step.action_path
+        return None, None
+
+    def take_screenshot(self, step_index: Optional[int] = None) -> None:
         self._refresh_capture_region()
-        self.recorder.fps = self.fps_spin.value()
+        number, path_ref = self._step_ref(step_index)
+        try:
+            path = self.recorder.screenshot(self._evidence_name(f"step{number}" if number else "shot"))
+        except Exception as exc:
+            self._show_error(f"Screenshot failed: {exc}")
+            return
+        self._add_evidence(EvidenceItem(path, "screenshot", number, path_ref))
+
+    def toggle_recording(self) -> None:
+        if self.recorder.is_recording:
+            self.stop_recording()
+            return
+        self._refresh_capture_region()
         try:
             self.recorder.start()
         except Exception as exc:
             self._show_error(str(exc))
             return
-        self.rec_status.setText("<span style='color:#d9534f'>● REC</span>  starting…")
-        self._update_controls()
+        self._recording_step = None  # recordings cover the whole test
+        self.evidence_panel.set_recording(True, "00:00")
+
+    def _save_recording(self) -> EvidenceItem:
+        name = self._evidence_name("recording")
+        if self.evidence_panel.format_combo.currentText() == "MP4":
+            path = self.recorder.stop_and_save_mp4(name)
+        else:
+            path = self.recorder.stop_and_save_gif(name)
+        return EvidenceItem(path, "recording")
 
     def stop_recording(self) -> None:
-        self.rec_stop_btn.setEnabled(False)
-        self.rec_status.setText("Saving GIF…")
+        self.evidence_panel.record_btn.setEnabled(False)
+        self.evidence_panel.set_recording(False)
+        self.rec_pill.set_state("Saving…", "warn")
         self._run_task(
-            self.recorder.stop_and_save_gif,
-            on_success=self._on_evidence_saved,
-            on_finished=self._update_controls,
+            self._save_recording,
+            on_success=self._add_evidence,
+            on_finished=lambda: (self.evidence_panel.record_btn.setEnabled(True), self.rec_pill.hide()),
         )
-
-    def _on_evidence_saved(self, path: Path) -> None:
-        self.last_evidence = Path(path)
-        size_mb = self.last_evidence.stat().st_size / 1e6
-        self.rec_status.setText("Idle")
-        self.evidence_label.setText(f"Latest: {self.last_evidence.name} ({size_mb:.1f} MB)")
-        self.evidence_label.setToolTip(str(self.last_evidence))
 
     def open_evidence_folder(self) -> None:
         self.recorder.output_dir.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.recorder.output_dir)))
 
-    # ============================================================= step 4
-    def test_ado_connection(self) -> None:
-        if not self._require_ado():
+    # ===================================================== publish
+    def publish(self) -> None:
+        if self.session is None or self.ado_client is None:
             return
-        self._set_verdict_busy(True)
-        self.ado_status.setText("Connecting…")
-        self._run_task(
-            self.ado_client.authenticate,
-            on_success=lambda info: self.ado_status.setText(
-                f"✔ Connected to <b>{info['organization']}/{info['project']}</b>"
-            ),
-            on_error=self._on_ado_error,
-            on_finished=lambda: self._set_verdict_busy(False),
-        )
+        session = self.session
+        suggested = session.suggested_outcome()
+        outcome = self.publish_panel.chosen_outcome(suggested)
+        if outcome is None:
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "Not every step has a result yet.\nMark the remaining steps, or pick an outcome explicitly.",
+            )
+            return
+        unmarked = sum(1 for s in session.steps if s.outcome == UNSPECIFIED)
+        if outcome == PASSED and unmarked:
+            answer = QMessageBox.question(self, APP_NAME, f"{unmarked} step(s) have no result. Publish as Passed anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
-    def submit_verdict(self, outcome: str) -> None:
-        if not self._require_ado():
-            return
-        if not self.point_edit.text():
-            QMessageBox.warning(self, APP_NAME, "Enter the ADO Test Point ID first.")
-            self.point_edit.setFocus()
-            return
-        if not self.plan_edit.text():
-            QMessageBox.warning(self, APP_NAME, "Enter the ADO Test Plan ID first.")
-            self.plan_edit.setFocus()
-            return
-
-        point_id = int(self.point_edit.text())
-        plan_id = int(self.plan_edit.text())
-        comment = self.comment_edit.toPlainText().strip() or None
-        attach = self.attach_chk.isChecked()
-        stop_active = self.recorder.is_recording and bool(self.ev_cfg.get("auto_stop_on_verdict", True))
-        previous = self.last_evidence
+        comment = self.publish_panel.comment_edit.toPlainText().strip() or None
+        create_bug = self.publish_panel.bug_chk.isChecked()
+        stop_recording = self.recorder.is_recording and bool(self.ev_cfg.get("auto_stop_on_publish", True))
 
         def job() -> dict[str, Any]:
-            files: list[Path] = []
-            new_evidence = None
-            if stop_active:
-                new_evidence = self.recorder.stop_and_save_gif()
-            evidence = new_evidence or previous
-            if attach and evidence and evidence.exists():
-                files.append(evidence)
-            report = self.ado_client.record_point_outcome(
-                point_id, outcome, comment=comment, attachments=files, plan_id=plan_id
-            )
-            report["new_evidence"] = new_evidence
-            return report
+            if stop_recording:
+                session.evidence.append(self._save_recording())
+            return self.ado_client.record_execution(session, outcome, comment, create_bug=create_bug)
 
-        self._set_verdict_busy(True)
-        self.ado_status.setText(f"Publishing <b>{outcome}</b> for point {point_id}…")
+        self.publish_panel.publish_btn.setEnabled(False)
+        self.publish_panel.status.setText(f"Publishing <b>{outcome}</b>…")
         self._run_task(
             job,
-            on_success=self._on_verdict_published,
-            on_error=self._on_ado_error,
-            on_finished=lambda: (self._set_verdict_busy(False), self._update_controls()),
+            on_success=self._on_published,
+            on_error=self._on_publish_error,
+            on_finished=self._refresh_session_views,
         )
 
-    def _on_verdict_published(self, report: dict[str, Any]) -> None:
-        if report.get("new_evidence"):
-            self._on_evidence_saved(report["new_evidence"])
-        files = ", ".join(report["attachments"]) or "none"
-        self.ado_status.setText(
-            f"✔ <b>{report['outcome']}</b> → run <a href='{report['url']}'>#{report['run_id']}</a>"
-            f"<br>Attachments: {files}"
-        )
+    def _on_published(self, report: dict[str, Any]) -> None:
+        self.session_published = True
+        if self.session:
+            self.explorer.set_point_outcome(self.session.point.id, report["outcome"])
+        lines = [f"✔ <b>{report['outcome']}</b> published → <a style='color:#79b0ff' href='{report['url']}'>run #{report['run_id']}</a>"]
+        if report["attachments"]:
+            lines.append(f"{len(report['attachments'])} attachment(s) uploaded")
+        if report.get("bug"):
+            lines.append(f"🐞 <a style='color:#79b0ff' href='{report['bug']['url']}'>Bug #{report['bug']['id']}</a> created and linked")
+        if report.get("bug_error"):
+            lines.append(f"<span style='color:#ff7b72'>Bug not created: {report['bug_error']}</span>")
+        self.publish_panel.status.setText("<br>".join(lines))
         log.info("Published %s (run %s, result %s)", report["outcome"], report["run_id"], report["result_id"])
-        self.comment_edit.clear()
 
-    def _on_ado_error(self, message: str) -> None:
-        self.ado_status.setText(f"<span style='color:#d9534f'>✖ {message}</span>")
+    def _on_publish_error(self, message: str) -> None:
+        self.publish_panel.status.setText(f"<span style='color:#ff7b72'>✖ {message}</span>")
         self._show_error(message)
-
-    def _require_ado(self) -> bool:
-        if self.ado_client is None:
-            QMessageBox.warning(
-                self, APP_NAME, "Azure DevOps is not configured. Fill in config.yaml and set ADO_PAT, then restart."
-            )
-            return False
-        return True
 
     # ============================================================ shutdown
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._session_dirty():
+            answer = QMessageBox.question(self, APP_NAME, "There are unpublished results. Quit anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         self._region_timer.stop()
         self._watchdog.stop()
         if self.recorder.is_recording:
@@ -634,26 +751,31 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-STYLESHEET = """
-QFrame#hostFrame { background: #1e1e1e; border: 1px solid #3c3c3c; }
-QLabel#placeholder { color: #8a8a8a; font-size: 15px; }
-QLabel#exeLabel { padding: 4px 8px; border: 1px solid #c8c8c8; border-radius: 4px; }
-QPushButton { padding: 6px 10px; }
-QPushButton#primary { font-weight: bold; }
-QPushButton#record { color: #c9302c; font-weight: bold; }
-QPushButton#pass { background: #2e7d32; color: white; font-weight: bold; }
-QPushButton#fail { background: #c62828; color: white; font-weight: bold; }
-QPushButton#pass:disabled, QPushButton#fail:disabled { background: #9e9e9e; }
-QGroupBox { font-weight: bold; margin-top: 8px; }
-QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
-"""
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument("--demo", action="store_true", help="offline demo with sample Azure DevOps data")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="path to config.yaml")
+    args, qt_args = parser.parse_known_args(argv)
 
-
-def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName(APP_NAME)
-    window = MainWindow(load_config())
+
+    client = None
+    if args.demo:
+        from demo_data import DemoAdoClient
+
+        client = DemoAdoClient()
+    window = MainWindow(load_config(args.config), ado_client=client, demo=args.demo)
+    if args.demo:
+        from demo_data import DemoAppWidget
+
+        demo_app = DemoAppWidget(window.host_frame)
+        demo_app.setGeometry(window.host_frame.rect().adjusted(1, 1, -1, -1))
+        window.host_frame.resized.connect(
+            lambda: demo_app.setGeometry(window.host_frame.rect().adjusted(1, 1, -1, -1))
+        )
+        demo_app.show()
     window.show()
     return app.exec()
 

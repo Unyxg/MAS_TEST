@@ -6,6 +6,15 @@ main top-level window (HWND) by polling ``win32gui.EnumWindows``, and re-parents
 that window into a Qt host widget with ``win32gui.SetParent`` after stripping
 its native caption/borders so it looks like part of the dashboard.
 
+Two embedding modes are supported:
+
+* ``reparent`` - true child window via ``SetParent`` (what the brief asked for).
+  Cross-process parent/child windows share an input queue, which some apps
+  (Chromium/Electron, some WPF) handle badly.
+* ``dock`` - the window stays top-level but becomes borderless, *owned* by the
+  dashboard (so it stays above it and minimises with it) and is kept glued on
+  top of the host frame. Less invasive; works with more applications.
+
 Only the Windows code paths are functional; the module imports cleanly on other
 platforms so the UI can still be opened for layout work.
 """
@@ -37,6 +46,9 @@ log = logging.getLogger(__name__)
 # (hidden UWP frames, windows on other virtual desktops, ...).
 _DWMWA_CLOAKED = 14
 _MIN_WINDOW_SIDE = 50  # px - ignore tiny helper / message windows
+_GWLP_HWNDPARENT = -8  # owner slot of a top-level window
+
+EMBED_MODES = ("reparent", "dock")
 
 
 class EmbedError(RuntimeError):
@@ -51,6 +63,7 @@ class _SavedWindowState:
     style: int
     ex_style: int
     rect: tuple[int, int, int, int]
+    owner: int = 0
 
 
 def _require_windows() -> None:
@@ -85,6 +98,15 @@ if IS_WINDOWS:
     )
 
 
+def _set_owner(hwnd: int, owner: int) -> int:
+    """Set a top-level window's owner (GWLP_HWNDPARENT); returns the previous one."""
+    user32 = ctypes.windll.user32
+    setter = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+    setter.restype = ctypes.c_void_p
+    setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    return setter(hwnd, _GWLP_HWNDPARENT, owner) or 0
+
+
 def _is_cloaked(hwnd: int) -> bool:
     cloaked = ctypes.c_int(0)
     try:
@@ -111,6 +133,7 @@ class WindowManager:
         self.pid: Optional[int] = None
         self.hwnd: Optional[int] = None
         self.host_hwnd: Optional[int] = None
+        self.mode: str = "reparent"
 
         self._launch_time = 0.0
         self._saved: Optional[_SavedWindowState] = None
@@ -255,63 +278,94 @@ class WindowManager:
         return candidates[0][2]
 
     # ----------------------------------------------------------------- embed
-    def embed(self, host_hwnd: int, hwnd: Optional[int] = None) -> None:
-        """Strip ``hwnd``'s borders and re-parent it into ``host_hwnd``.
+    def embed(
+        self,
+        host_hwnd: int,
+        hwnd: Optional[int] = None,
+        mode: str = "reparent",
+        owner_hwnd: Optional[int] = None,
+    ) -> None:
+        """Strip ``hwnd``'s borders and put it inside / on top of ``host_hwnd``.
 
+        ``mode="dock"`` requires ``owner_hwnd`` (the dashboard's top-level HWND).
         Must be called from the Qt GUI thread.
         """
         _require_windows()
+        if mode not in EMBED_MODES:
+            raise ValueError(f"mode must be one of {EMBED_MODES}")
         hwnd = hwnd or self.hwnd
         if not hwnd or not win32gui.IsWindow(hwnd):
             raise EmbedError("Target window handle is not valid.")
-        if self._saved is not None and self._saved.hwnd != hwnd:
+        if self._saved is not None:
             self.release()
 
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
         ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        if self._saved is None:
-            self._saved = _SavedWindowState(hwnd, style, ex_style, win32gui.GetWindowRect(hwnd))
-
         if win32gui.IsIconic(hwnd) or style & win32con.WS_MAXIMIZE:
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-
-        # Per the SetParent docs: clear WS_POPUP and set WS_CHILD *before* re-parenting.
-        new_style = (style & ~_STRIP_STYLE) | win32con.WS_CHILD | win32con.WS_VISIBLE
+        self._saved = _SavedWindowState(hwnd, style, ex_style, win32gui.GetWindowRect(hwnd))
         new_ex_style = ex_style & ~_STRIP_EX_STYLE
-        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, _int32(new_style))
-        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, _int32(new_ex_style))
 
         try:
-            win32gui.SetParent(hwnd, host_hwnd)
-        except pywintypes.error as exc:
+            if mode == "reparent":
+                # Per the SetParent docs: clear WS_POPUP and set WS_CHILD *before* re-parenting.
+                new_style = (style & ~_STRIP_STYLE) | win32con.WS_CHILD | win32con.WS_VISIBLE
+                win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, _int32(new_style))
+                win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, _int32(new_ex_style))
+                win32gui.SetParent(hwnd, host_hwnd)
+            else:
+                if not owner_hwnd:
+                    raise EmbedError("Dock mode needs the dashboard window handle.")
+                new_style = (style & ~_STRIP_STYLE) | win32con.WS_POPUP | win32con.WS_VISIBLE
+                win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, _int32(new_style))
+                # Hide from the taskbar while docked.
+                win32gui.SetWindowLong(
+                    hwnd, win32con.GWL_EXSTYLE, _int32(new_ex_style | win32con.WS_EX_TOOLWINDOW)
+                )
+                self._saved.owner = _set_owner(hwnd, owner_hwnd)
+        except (pywintypes.error, OSError) as exc:
             # Typical cause: target runs elevated (UIPI) and we don't.
             self._restore_styles()
-            raise EmbedError(f"SetParent failed: {exc}. Is the target running elevated?") from exc
+            self._saved = None
+            raise EmbedError(f"Embedding failed: {exc}. Is the target running elevated?") from exc
 
+        self.mode = mode
         self.hwnd = hwnd
         self.host_hwnd = host_hwnd
         self.fit_to_host()
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-        log.info("Embedded window 0x%08X into host 0x%08X", hwnd, host_hwnd)
+        log.info("Embedded window 0x%08X into host 0x%08X (%s mode)", hwnd, host_hwnd, mode)
 
     def fit_to_host(self) -> None:
-        """Resize the embedded window to fill the host's client area."""
+        """Make the embedded window exactly cover the host's client area."""
         if not (IS_WINDOWS and self.host_hwnd and self.window_exists() and self._saved):
             return
         left, top, right, bottom = win32gui.GetClientRect(self.host_hwnd)
-        win32gui.SetWindowPos(
-            self.hwnd,
-            win32con.HWND_TOP,
-            0,
-            0,
-            max(1, right - left),
-            max(1, bottom - top),
-            win32con.SWP_NOZORDER
-            | win32con.SWP_NOACTIVATE
-            | win32con.SWP_FRAMECHANGED
-            | win32con.SWP_SHOWWINDOW,
-        )
+        width, height = max(1, right - left), max(1, bottom - top)
+        x, y = 0, 0
+        if self.mode == "dock":
+            x, y = win32gui.ClientToScreen(self.host_hwnd, (0, 0))
+        try:
+            win32gui.SetWindowPos(
+                self.hwnd,
+                win32con.HWND_TOP,
+                x,
+                y,
+                width,
+                height,
+                win32con.SWP_NOZORDER
+                | win32con.SWP_NOACTIVATE
+                | win32con.SWP_FRAMECHANGED
+                | win32con.SWP_SHOWWINDOW,
+            )
+        except pywintypes.error as exc:
+            log.debug("fit_to_host failed: %s", exc)
+
+    def set_visible(self, visible: bool) -> None:
+        """Hide/show a docked window (e.g. while the host frame is hidden)."""
+        if self.window_exists() and self._saved:
+            win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE if visible else win32con.SW_HIDE)
 
     def focus(self) -> None:
         """Give keyboard focus to the embedded window."""
@@ -332,7 +386,10 @@ class WindowManager:
         saved = self._saved
         if win32gui.IsWindow(saved.hwnd):
             try:
-                win32gui.SetParent(saved.hwnd, 0)
+                if self.mode == "reparent":
+                    win32gui.SetParent(saved.hwnd, 0)
+                else:
+                    _set_owner(saved.hwnd, saved.owner)
                 self._restore_styles()
                 left, top, right, bottom = saved.rect
                 win32gui.SetWindowPos(

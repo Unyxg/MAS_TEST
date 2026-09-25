@@ -158,6 +158,21 @@ class EvidenceRecorder:
             with self._lock:
                 self._frames.append(buf.tobytes())
 
+    # ------------------------------------------------------------- screenshot
+    def screenshot(self, filename: Optional[str] = None) -> Path:
+        """Save a single full-resolution PNG of the current region."""
+        region = self.region_provider()
+        if not region or region.get("width", 0) <= 0 or region.get("height", 0) <= 0:
+            raise RuntimeError("Capture region is not visible on screen.")
+        with mss.mss() as sct:
+            frame = cv2.cvtColor(np.asarray(sct.grab(region)), cv2.COLOR_BGRA2BGR)
+        name = filename or f"screenshot_{datetime.now():%Y%m%d_%H%M%S_%f}"[:-3]
+        path = self._output_path(name, ".png")
+        if not cv2.imwrite(str(path), frame):
+            raise RuntimeError(f"Could not write {path}")
+        log.info("Saved screenshot: %s", path)
+        return path
+
     # ----------------------------------------------------------------- saving
     def stop_and_save_gif(self, filename: Optional[str] = None) -> Path:
         self.stop()
