@@ -1,0 +1,33 @@
+# MAS-QA-Bridge configuration
+# ---------------------------------------------------------------------------
+# Do NOT commit a real PAT. Leave `pat` empty and set the ADO_PAT environment
+# variable instead (it takes precedence over this file).
+
+ado:
+  organization: "your-organization"      # https://dev.azure.com/<organization>
+  project: "Your Project"                # project name (spaces are fine)
+  pat: ""                                # prefer: setx ADO_PAT "<token>"
+  test_plan_id: 0                        # default plan; can be overridden in the UI
+  base_url: "https://dev.azure.com"      # Azure DevOps Server: "https://server/tfs"
+  api_version: "7.1"
+  attachment_api_version: "7.1-preview.1"
+  attachment_target: "result"            # result | run | both
+  run_name_prefix: "MAS-QA-Bridge"
+  timeout_seconds: 30
+  verify_ssl: true
+
+app:
+  default_executable: ""                 # e.g. "C:/Program Files/MyApp/MyApp.exe"
+  launch_args: []                        # e.g. ["--test-mode"]
+  window_title_contains: ""              # optional filter to skip splash screens
+  window_find_timeout_seconds: 20
+  on_exit: "release"                     # release | terminate
+
+evidence:
+  output_dir: "temp_evidence"            # relative to the project folder
+  fps: 8
+  max_seconds: 180                       # capture auto-stops after this
+  max_width: 1280                        # frames are downscaled to this width
+  jpeg_quality: 90                       # in-memory frame compression
+  memory_budget_mb: 512                  # GIF is downscaled further to fit
+  auto_stop_on_verdict: true             # Pass/Fail stops + attaches an active recording
