@@ -3,13 +3,24 @@
 # Output: dist/MAS-QA-Bridge/MAS-QA-Bridge.exe (+ _internal/). config.yaml goes next to the .exe.
 from pathlib import Path
 
+from PyInstaller.utils.hooks import copy_metadata
+
 ROOT = Path(SPECPATH).parent
+
+# Some libraries read their own package metadata at import time
+# (imageio: importlib.metadata.version("imageio")) - bundle it.
+datas = []
+for dist in ("imageio", "mss", "pillow", "numpy", "requests", "PyYAML", "psutil", "opencv-python"):
+    try:
+        datas += copy_metadata(dist)
+    except Exception:
+        pass
 
 a = Analysis(
     [str(ROOT / "app.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=[
         # imageio picks its writer plugin by name at runtime
         "imageio.plugins.pillow",
