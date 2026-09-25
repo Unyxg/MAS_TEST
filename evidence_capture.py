@@ -26,6 +26,9 @@ from mss.exception import ScreenShotError
 
 log = logging.getLogger(__name__)
 
+# mss >= 10 renamed the factory to mss.MSS (mss.mss is deprecated).
+_mss_factory = getattr(mss, "MSS", None) or mss.mss
+
 # mss-style region in *physical* screen pixels: {"left", "top", "width", "height"}
 Region = dict[str, int]
 RegionProvider = Callable[[], Optional[Region]]
@@ -117,7 +120,7 @@ class EvidenceRecorder:
         max_frames = max(1, int(self.fps * self.max_seconds))
         try:
             # mss handles must be created in the thread that uses them.
-            with mss.mss() as sct:
+            with _mss_factory() as sct:
                 next_tick = time.perf_counter()
                 while not self._stop.is_set():
                     region = self.region_provider()
@@ -164,7 +167,7 @@ class EvidenceRecorder:
         region = self.region_provider()
         if not region or region.get("width", 0) <= 0 or region.get("height", 0) <= 0:
             raise RuntimeError("Capture region is not visible on screen.")
-        with mss.mss() as sct:
+        with _mss_factory() as sct:
             frame = cv2.cvtColor(np.asarray(sct.grab(region)), cv2.COLOR_BGRA2BGR)
         name = filename or f"screenshot_{datetime.now():%Y%m%d_%H%M%S_%f}"[:-3]
         path = self._output_path(name, ".png")

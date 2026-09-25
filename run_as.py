@@ -144,7 +144,7 @@ def launch_elevated(exe_path: str, args: Sequence[str], cwd: Optional[str]) -> L
 
     try:
         info = shell.ShellExecuteEx(
-            fMask=shellcon.SEE_MASK_NOCLOSEPROCESS | shellcon.SEE_MASK_NOASYNC,
+            fMask=shellcon.SEE_MASK_NOCLOSEPROCESS | 0x00000100,  # SEE_MASK_NOASYNC
             lpVerb="runas",
             lpFile=exe_path,
             lpParameters=subprocess.list2cmdline(list(args)),
@@ -163,37 +163,72 @@ def launch_elevated(exe_path: str, args: Sequence[str], cwd: Optional[str]) -> L
 def launch_as_user(
     exe_path: str, args: Sequence[str], cwd: Optional[str], credentials: Credentials
 ) -> LaunchedProcess:
-    """Start as another Windows account (like "Run as different user")."""
-    import win32process
+    """Start as another Windows account (like "Run as different user").
+
+    pywin32 does not wrap CreateProcessWithLogonW, so it is called via ctypes.
+    """
+    import ctypes.wintypes as wt
+
+    import pywintypes
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wt.DWORD), ("lpReserved", wt.LPWSTR), ("lpDesktop", wt.LPWSTR), ("lpTitle", wt.LPWSTR),
+            ("dwX", wt.DWORD), ("dwY", wt.DWORD), ("dwXSize", wt.DWORD), ("dwYSize", wt.DWORD),
+            ("dwXCountChars", wt.DWORD), ("dwYCountChars", wt.DWORD), ("dwFillAttribute", wt.DWORD),
+            ("dwFlags", wt.DWORD), ("wShowWindow", wt.WORD), ("cbReserved2", wt.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_ubyte)),
+            ("hStdInput", wt.HANDLE), ("hStdOutput", wt.HANDLE), ("hStdError", wt.HANDLE),
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [("hProcess", wt.HANDLE), ("hThread", wt.HANDLE), ("dwProcessId", wt.DWORD), ("dwThreadId", wt.DWORD)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = advapi32.CreateProcessWithLogonW
+    create.argtypes = [
+        wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPWSTR,
+        wt.DWORD, wt.LPVOID, wt.LPCWSTR, ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    create.restype = wt.BOOL
 
     logon_with_profile = 0x00000001
-    startup = win32process.STARTUPINFO()
-    try:
-        handle, thread, pid, _tid = win32process.CreateProcessWithLogonW(
-            credentials.username,
-            credentials.domain or None,
-            credentials.password,
-            logon_with_profile,
-            exe_path,
-            _command_line(exe_path, args),
-            0,
-            None,
-            cwd,
-            startup,
-        )
-    except Exception as exc:
-        code = getattr(exc, "winerror", None)
+    startup = STARTUPINFOW()
+    startup.cb = ctypes.sizeof(STARTUPINFOW)
+    info = PROCESS_INFORMATION()
+    command_line = ctypes.create_unicode_buffer(_command_line(exe_path, args))  # must be writable
+    ok = create(
+        credentials.username,
+        credentials.domain or None,
+        credentials.password,
+        logon_with_profile,
+        exe_path,
+        command_line,
+        0,
+        None,
+        cwd,
+        ctypes.byref(startup),
+        ctypes.byref(info),
+    )
+    if not ok:
+        code = ctypes.get_last_error()
         messages = {
             1326: "The user name or password is incorrect.",
             1385: "That account is not allowed to log on to this computer (logon type not granted).",
             1331: "That account is disabled.",
             1907: "That account's password must be changed before logging on.",
+            1909: "That account is locked out.",
             267: "The working directory is not accessible to that account.",
-            5: "Access denied - that account cannot read the executable.",
+            5: "Access denied - that account cannot run the executable.",
         }
-        raise PermissionError(messages.get(code, f"Could not start as {credentials.account}: {exc}")) from exc
-    thread.Close()
-    return LaunchedProcess(pid, handle, credentials.account)
+        raise PermissionError(
+            messages.get(code, f"Could not start as {credentials.account}: {ctypes.FormatError(code)} (error {code})")
+        )
+    kernel32.CloseHandle(info.hThread)
+    # Wrap in a PyHANDLE so win32process/win32api helpers accept it (and it is closed on release).
+    handle = pywintypes.HANDLE(info.hProcess)
+    return LaunchedProcess(int(info.dwProcessId), handle, credentials.account)
 
 
 def launch(

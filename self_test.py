@@ -49,7 +49,7 @@ def run_self_test(base_dir: Path, config_path: Path) -> int:
         import mss
         import numpy as np
 
-        with mss.mss() as sct:
+        with (getattr(mss, "MSS", None) or mss.mss)() as sct:
             mon = sct.monitors[1]
             shot = np.asarray(sct.grab({"left": mon["left"], "top": mon["top"], "width": 200, "height": 120}))
         return f"grabbed {shot.shape[1]}x{shot.shape[0]} from a {mon['width']}x{mon['height']} monitor"

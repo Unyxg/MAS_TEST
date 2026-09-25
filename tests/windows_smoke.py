@@ -52,7 +52,7 @@ def pump(app: QApplication, seconds: float) -> None:
 
 
 def desktop_png(name: str) -> None:
-    with mss.mss() as sct:
+    with (getattr(mss, "MSS", None) or mss.mss)() as sct:
         shot = sct.grab(sct.monitors[1])
         mss_tools.to_png(shot.rgb, shot.size, output=str(OUT / f"{name}.png"))
 
