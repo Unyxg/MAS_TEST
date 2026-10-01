@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QShowEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
+    QFrame,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -61,15 +64,37 @@ class BugDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Report a bug")
         self.setObjectName("bugDialog")
-        self.resize(980, 820)
+        # Fit the screen the tester actually has (laptops at 125-150% scaling are short), stay resizable.
+        self.setSizeGripEnabled(True)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setMinimumSize(560, 420)
+        self._fit_to_screen()
         self.report = report
         self.meta = meta or {}
         self.drafts_dir = drafts_dir
         self.created_bug: Optional[dict[str, Any]] = None
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 14)
+        # Layout: [ scrollable form ............ ]  <- grows / scrolls on short screens
+        #         [ validation message + buttons ]  <- always visible
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        form_page = QWidget()
+        root = QVBoxLayout(form_page)
+        root.setContentsMargins(18, 16, 18, 8)
         root.setSpacing(10)
+        self._scroll.setWidget(form_page)
+        outer.addWidget(self._scroll, stretch=1)
+        footer = QWidget()
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(18, 6, 18, 14)
+        footer_layout.setSpacing(8)
+        outer.addWidget(footer)
 
         # ---- heading
         heading = QLabel("🐞  Report a bug")
@@ -96,14 +121,20 @@ class BugDialog(QDialog):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(6)
         self.severity = QComboBox()
+        self.severity.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.severity.setMinimumContentsLength(8)
         self.severity.addItems(self.meta.get("severities") or SEVERITIES)
         self.severity.setCurrentText(report.severity)
         self.severity.setToolTip("Impact on the user: 1 crash/data loss · 2 major feature broken · 3 workaround exists · 4 cosmetic")
         self.priority = QComboBox()
+        self.priority.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.priority.setMinimumContentsLength(8)
         self.priority.addItems([str(p) for p in PRIORITIES])
         self.priority.setCurrentText(str(report.priority))
         self.priority.setToolTip("How soon it should be fixed (1 = immediately)")
         self.repro = QComboBox()
+        self.repro.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.repro.setMinimumContentsLength(8)
         self.repro.addItems(REPRODUCIBILITY)
         self.repro.setCurrentText(report.reproducibility)
         self.found_in = QLineEdit(report.found_in)
@@ -166,6 +197,8 @@ class BugDialog(QDialog):
         self.preview.setOpenExternalLinks(True)
         self.tabs.addTab(self.preview, "Preview")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Never squeeze the tab pages (rows would overlap): the whole form scrolls instead.
+        self.tabs.setMinimumHeight(self.tabs.sizeHint().height())
         root.addWidget(self.tabs, stretch=1)
 
         # ---- footer
@@ -174,7 +207,7 @@ class BugDialog(QDialog):
         self.message.setTextFormat(Qt.TextFormat.RichText)
         self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         self.message.setOpenExternalLinks(True)
-        root.addWidget(self.message)
+        footer_layout.addWidget(self.message)
 
         buttons = QHBoxLayout()
         self.save_btn = QPushButton("Save draft")
@@ -191,7 +224,7 @@ class BugDialog(QDialog):
         buttons.addStretch()
         buttons.addWidget(self.cancel_btn)
         buttons.addWidget(self.submit_btn)
-        root.addLayout(buttons)
+        footer_layout.addLayout(buttons)
 
         self._fill_details(report)
         self._update_validation()
@@ -204,13 +237,33 @@ class BugDialog(QDialog):
                 self._update_validation
             )
 
+    def _fit_to_screen(self) -> None:
+        screen = (self.parent().screen() if self.parent() is not None else None) or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        self.resize(min(980, int(avail.width() * 0.92)), min(820, int(avail.height() * 0.90)))
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        # Keep the whole window (title bar + buttons) on screen.
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        frame = self.frameGeometry()
+        x = min(max(frame.x(), avail.left()), max(avail.left(), avail.right() - frame.width() + 1))
+        y = min(max(frame.y(), avail.top()), max(avail.top(), avail.bottom() - frame.height() + 1))
+        if (x, y) != (frame.x(), frame.y()):
+            self.move(x, y)
+
     # ------------------------------------------------------------ building
     @staticmethod
     def _path_combo(paths: Optional[list[str]], current: str) -> QComboBox:
         combo = QComboBox()
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(14)  # long area/iteration paths must not widen the form
         combo.setEditable(True)
         combo.addItems(paths or [])
         combo.setCurrentText(current or (paths[0] if paths else ""))
+        if combo.lineEdit() is not None:
+            combo.lineEdit().setCursorPosition(0)  # show the start of long paths
         combo.setToolTip("Leave the project root to let the team triage it")
         return combo
 
@@ -219,9 +272,11 @@ class BugDialog(QDialog):
         form = QFormLayout(page)
         form.setContentsMargins(10, 12, 10, 10)
         form.setVerticalSpacing(8)
-        self.summary_edit = _text_edit("One or two sentences: what is broken and what it affects.", 48)
+        self.summary_edit = _text_edit("One or two sentences: what is broken and what it affects.", 44)
+        self.summary_edit.setMaximumHeight(90)
         self.pre_edit = _text_edit("Data, account, settings or state needed before step 1 (e.g. 'Customer Fabrikam exists').", 44)
-        self.steps_edit = _text_edit("One step per line. Keep them short and concrete.", 150)
+        self.pre_edit.setMaximumHeight(90)
+        self.steps_edit = _text_edit("One step per line. Keep them short and concrete.", 110)
         self.fail_spin = QSpinBox()
         self.fail_spin.setRange(0, 999)
         self.fail_spin.setSpecialValueText("—")
@@ -285,7 +340,7 @@ class BugDialog(QDialog):
         self.thumbnail = QLabel("Select an item to preview")
         self.thumbnail.setObjectName("muted")
         self.thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumbnail.setMinimumWidth(380)
+        self.thumbnail.setMinimumWidth(220)
         layout.addLayout(left, stretch=1)
         layout.addWidget(self.thumbnail, stretch=1)
         return page
@@ -377,7 +432,12 @@ class BugDialog(QDialog):
     def _update_validation(self) -> None:
         errors, warnings = self.collect().validate()
         parts = [f"<span style='color:#ff7b72'>✖ {e}</span>" for e in errors]
-        parts += [f"<span style='color:#e3b341'>⚠ {w}</span>" for w in warnings]
+        if warnings:  # one compact line: full list on hover and again when submitting
+            parts.append(
+                f"<span style='color:#e3b341'>⚠ {len(warnings)} thing(s) to review - hover here, "
+                "or see the list when you submit</span>"
+            )
+        self.message.setToolTip("\n".join("• " + w for w in warnings))
         self.message.setText("<br>".join(parts) if parts else "<span style='color:#56d364'>✔ Ready to submit</span>")
         self.submit_btn.setEnabled(not errors)
 
