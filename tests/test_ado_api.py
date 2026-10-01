@@ -141,3 +141,28 @@ def test_auth_error_names_what_was_used_but_never_the_token(monkeypatch):
     message = client._auth_help(401, "https://dev.azure.com/adient/My%20Project/_apis/test/runs")
     assert "adient" in message and "ADO_PAT environment variable" in message and "(52 characters)" in message
     assert token not in message and "SECRETTOKEN" not in message
+
+
+def test_legacy_visualstudio_address_has_no_organization_segment():
+    cfg = AdoConfig.from_dict({"organization": "adient", "project": "MAS 10 Test", "pat": "x" * 52,
+                               "base_url": "https://adient.visualstudio.com"})
+    client = AdoTestClient(cfg)
+    assert client.project_url == "https://adient.visualstudio.com/MAS%2010%20Test"
+    modern = AdoTestClient(AdoConfig.from_dict({"organization": "adient", "project": "MAS 10 Test", "pat": "x" * 52}))
+    assert modern.project_url == "https://dev.azure.com/adient/MAS%2010%20Test"
+
+
+def test_unknown_project_is_diagnosed_with_the_real_names(client):
+    client.config.project = "Wrong Name"
+    original = client._send
+
+    def send(method, path, **kw):
+        if path == "test/runs":
+            raise AdoError("rejected", 404)
+        return original(method, path, **kw)
+
+    client._send = send
+    checks = client.run_diagnostics()
+    assert checks[0][1] is False
+    assert checks[1][0] == "Projects visible to this token" and checks[1][1] is False
+    assert "Orders Portal" in checks[1][2] and "NOT one of them" in checks[1][2]

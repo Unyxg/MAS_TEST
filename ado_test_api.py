@@ -40,7 +40,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -244,6 +244,11 @@ class AdoTestClient:
     # ----------------------------------------------------------------- basics
     @property
     def org_url(self) -> str:
+        host = urlparse(self.config.base_url).hostname or ""
+        if host.endswith(".visualstudio.com"):
+            # Legacy address: the organization is the sub-domain (https://adient.visualstudio.com/<project>),
+            # there is no organization segment in the path.
+            return self.config.base_url
         return f"{self.config.base_url}/{quote(self.config.organization, safe='')}"
 
     @property
@@ -266,8 +271,10 @@ class AdoTestClient:
         content_type: Optional[str] = None,
         params: Optional[dict[str, Any]] = None,
         api_version: Optional[str] = None,
+        scope: str = "project",
     ) -> requests.Response:
-        url = f"{self.project_url}/_apis/{path.lstrip('/')}"
+        base = self.org_url if scope == "org" else self.project_url
+        url = f"{base}/_apis/{path.lstrip('/')}"
         query = {"api-version": api_version or self.config.api_version, **(params or {})}
         headers = {}
         if json_body is not None:
@@ -291,7 +298,14 @@ class AdoTestClient:
                 detail = resp.json().get("message", resp.text)
             except ValueError:
                 detail = resp.text
-            raise AdoError(f"{method} {url} -> HTTP {resp.status_code}: {detail[:500]}", resp.status_code)
+            hint = ""
+            if resp.status_code == 404:
+                hint = (
+                    f"\n\nNot found: check ado.organization ('{self.config.organization}'), ado.project "
+                    f"('{self.config.project}') and ado.base_url in config.yaml. The project is the name right "
+                    "after the organization in your Azure DevOps address."
+                )
+            raise AdoError(f"{method} {url} -> HTTP {resp.status_code}: {detail[:500]}{hint}", resp.status_code)
         return resp
 
     def _auth_help(self, status: int, url: str) -> str:
@@ -330,6 +344,11 @@ class AdoTestClient:
                 break
             query["continuationToken"] = token
         return items
+
+    def list_projects(self) -> list[str]:
+        """Names of the projects visible to the token (needs the optional 'Project and Team: Read' scope)."""
+        resp = self._send("GET", "projects", params={"$top": 500}, scope="org")
+        return sorted((p["name"] for p in (resp.json() or {}).get("value", [])), key=str.lower)
 
     def authenticate(self) -> dict[str, Any]:
         """Verify the PAT can read test data in the project."""
@@ -764,6 +783,23 @@ class AdoTestClient:
 
         auth = lambda: (self.authenticate(), f"PAT accepted for {self.config.organization}/{self.config.project}")[1]  # noqa: E731
         if not check("Authentication + test runs readable", auth):
+            try:
+                names = self.list_projects()
+                found = self.config.project.lower() in (n.lower() for n in names)
+                checks.append(
+                    (
+                        "Projects visible to this token",
+                        found,
+                        ("'" + self.config.project + "' exists, so the problem is the token or its scopes. " if found
+                         else f"'{self.config.project}' is NOT one of them - set ado.project to one of: ")
+                        + ", ".join(names[:20]),
+                    )
+                )
+            except AdoError:
+                checks.append(
+                    ("Projects visible to this token", True,
+                     "could not be listed (needs the optional 'Project and Team: Read' scope) - not required")
+                )
             return checks
         check("Read test plans", lambda: f"{len(self.list_plans())} active plan(s)")
         check(

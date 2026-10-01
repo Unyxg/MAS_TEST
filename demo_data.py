@@ -172,6 +172,8 @@ class DemoAdoClient(AdoTestClient):
         self.calls.append((method, path, body))
         parts = path.strip("/").split("/")
 
+        if path == "projects":
+            return _FakeResponse({"value": [{"name": "Orders Portal"}, {"name": "Platform"}]})
         if path == "test/runs" and method == "GET":
             return _FakeResponse({"count": 0, "value": []})
         if path == "testplan/plans":

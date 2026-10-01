@@ -141,6 +141,7 @@ It only sends fields that exist in your project's process (Agile, Scrum and CMMI
 | Message | Cause and fix |
 |---|---|
 | "config.yaml still has the example value(s)" | Set `ado.organization` (the name in `https://dev.azure.com/<organization>`) and `ado.project`. |
+| "Not found: check ado.organization, ado.project and ado.base_url" | The **project** is the name right after the organization in your address (`https://dev.azure.com/<organization>/<PROJECT>` or `https://<organization>.visualstudio.com/<PROJECT>`). A test plan or team name is not a project. **Check ADO** lists the projects your token can see when it can. |
 | "Azure DevOps rejected the sign-in" | The message lists the organization, project and where the token was read from (with its length, never the token). Check these in order: right organization and project, token not expired and created for that organization, scopes *Test Management* and *Work Items* (Read & write). |
 | The token length shown is not about 52 | `ADO_PAT` holds something else. Set it again with `setx ADO_PAT "<token>"`. |
 | Changed `ADO_PAT` but nothing changes | Programs started by **double-clicking** use Explorer's environment, which `setx` does not update. Sign out and in again (or restart Windows Explorer). A program started from a **new** Command Prompt window sees it immediately. |

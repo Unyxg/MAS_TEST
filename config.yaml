@@ -12,10 +12,13 @@
 
 ado:
   organization: "your-organization"      # https://dev.azure.com/<organization>
-  project: "Your Project"                # project name (spaces are fine)
+  project: "Your Project"                # the name right AFTER the organization in your address:
+                                         #   https://dev.azure.com/<organization>/<PROJECT>   or
+                                         #   https://<organization>.visualstudio.com/<PROJECT>
   pat: ""                                # prefer: setx ADO_PAT "<token>"
   test_plan_id: 0                        # plan pre-selected in the Test Explorer
-  base_url: "https://dev.azure.com"      # Azure DevOps Server: "https://server/tfs"
+  base_url: "https://dev.azure.com"      # normally leave as is. Old-style address: "https://<organization>.visualstudio.com"
+                                         # Azure DevOps Server (on-premises): "https://server/tfs"
   api_version: "7.1"
   attachment_api_version: "7.1-preview.1"
   attachment_target: "result"            # result | run | both
