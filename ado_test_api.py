@@ -613,6 +613,8 @@ class AdoTestClient:
                     "name": f.get("name", f["referenceName"]),
                     "required": bool(f.get("alwaysRequired")),
                     "allowed": [str(v) for v in (f.get("allowedValues") or [])],
+                    "default": f.get("defaultValue"),
+                    "help": f.get("helpText") or "",
                 }
                 for f in data.get("value", [])
             }
@@ -632,6 +634,34 @@ class AdoTestClient:
         walk(root, "")
         return paths
 
+    # Fields the app fills itself, or that Azure DevOps manages: never asked for in the form.
+    _HANDLED_FIELDS = {
+        "Microsoft.VSTS.Common.Priority",
+        "Microsoft.VSTS.Common.Severity",
+        "Microsoft.VSTS.Common.ValueArea",
+        "Microsoft.VSTS.TCM.ReproSteps",
+        "Microsoft.VSTS.TCM.SystemInfo",
+        "Microsoft.VSTS.Build.FoundIn",
+    }
+
+    def required_user_fields(self, work_item_type: str = "Bug") -> list[dict[str, Any]]:
+        """Fields the project's rules require a person to fill in (beyond the standard ones).
+
+        These are ``alwaysRequired`` fields without a default value, other than
+        System.* fields (title, state, area/iteration ids...) which are managed
+        by Azure DevOps or by this app.
+        """
+        out = []
+        for ref, meta in self.get_work_item_type_fields(work_item_type).items():
+            if (
+                meta["required"]
+                and meta.get("default") in (None, "")
+                and not ref.startswith("System.")
+                and ref not in self._HANDLED_FIELDS
+            ):
+                out.append({"ref": ref, "name": meta["name"], "allowed": meta["allowed"], "help": meta.get("help", "")})
+        return sorted(out, key=lambda f: f["name"].lower())
+
     def bug_metadata(self, work_item_type: str = "Bug") -> dict[str, Any]:
         """Everything the bug form needs: severity values, areas, iterations, required fields."""
         fields = self.get_work_item_type_fields(work_item_type)
@@ -642,6 +672,7 @@ class AdoTestClient:
             "areas": self.list_classification_paths("areas"),
             "iterations": self.list_classification_paths("iterations"),
             "required": sorted(m["name"] for m in fields.values() if m["required"]),
+            "required_custom": self.required_user_fields(work_item_type),
             "fields": set(fields),
         }
 

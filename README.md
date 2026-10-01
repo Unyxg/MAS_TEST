@@ -122,7 +122,7 @@ When you submit, the app:
 3. adds relations: **Tested By** to the test case, a **Hyperlink** to the test run, and **AttachedFile** for each piece of evidence,
 4. associates the bug with the test result, now if the result is already published or at publish time otherwise.
 
-It only sends fields that exist in your project's process (Agile, Scrum and CMMI differ), and tells you which ones it skipped. For projects on the **Basic** process, set `bug.work_item_type: Issue`. If your process has custom required fields, supply them in `bug.extra_fields`.
+It only sends fields that exist in your project's process (Agile, Scrum and CMMI differ), and tells you which ones it skipped. Fields that **your project requires** beyond the standard ones (for example *Detected in Phase* or *Requirement Add On*) are read from Azure DevOps when the app starts and shown in the form under **Required by your project**, as dropdowns where Azure DevOps defines the allowed values. A value you always use can be pre-filled in `bug.extra_fields` in `config.yaml` using the field's reference name (for example `{"Custom.DetectedInPhase": "System Test"}`). For projects on the **Basic** process, set `bug.work_item_type: Issue`. If your process has custom required fields, supply them in `bug.extra_fields`.
 
 **If submission fails** (a rule error, an expired PAT, a network error), the form stays open with the reason and the report is saved to `temp_evidence/bug_drafts/` as JSON and an HTML preview. Nothing is lost, and you can use **Load draft…** to retry.
 

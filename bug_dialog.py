@@ -128,6 +128,35 @@ class BugDialog(QDialog):
             grid.addWidget(widget, (i // 4) * 2 + 1, i % 4)
         root.addLayout(grid)
 
+        # ---- fields the project's rules require (custom fields: e.g. "Detected in Phase")
+        self._required = list(self.meta.get("required_custom") or [])
+        self._config_extras = dict(report.extra_fields)
+        self._extra_widgets: dict[str, QWidget] = {}
+        if self._required:
+            title = QLabel("REQUIRED BY YOUR PROJECT")
+            title.setObjectName("panelTitle")
+            root.addWidget(title)
+            extra_grid = QGridLayout()
+            extra_grid.setHorizontalSpacing(12)
+            extra_grid.setVerticalSpacing(6)
+            for i, spec in enumerate(self._required):
+                caption = QLabel(spec["name"] + " *")
+                caption.setObjectName("muted")
+                current = self._config_extras.get(spec["ref"], "")
+                if spec["allowed"]:
+                    widget: QWidget = QComboBox()
+                    widget.addItem("")  # force a conscious choice
+                    widget.addItems(spec["allowed"])
+                    widget.setCurrentText(current)
+                else:
+                    widget = QLineEdit(current)
+                if spec.get("help"):
+                    widget.setToolTip(spec["help"])
+                self._extra_widgets[spec["ref"]] = widget
+                extra_grid.addWidget(caption, (i // 4) * 2, i % 4)
+                extra_grid.addWidget(widget, (i // 4) * 2 + 1, i % 4)
+            root.addLayout(extra_grid)
+
         # ---- tabs
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_details_tab(), "Description")
@@ -170,6 +199,10 @@ class BugDialog(QDialog):
             edit.textChanged.connect(self._update_validation)
         for edit in (self.steps_edit, self.actual_edit, self.expected_edit):
             edit.textChanged.connect(self._update_validation)
+        for widget in self._extra_widgets.values():
+            (widget.currentTextChanged if isinstance(widget, QComboBox) else widget.textChanged).connect(
+                self._update_validation
+            )
 
     # ------------------------------------------------------------ building
     @staticmethod
@@ -334,6 +367,11 @@ class BugDialog(QDialog):
         r.attachments = [
             self.evidence_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.evidence_list.count())
         ]
+        extras = dict(self._config_extras)
+        for ref, widget in self._extra_widgets.items():
+            extras[ref] = (widget.currentText() if isinstance(widget, QComboBox) else widget.text()).strip()
+        r.extra_fields = {k: v for k, v in extras.items() if v}
+        r.required_extra = {spec["ref"]: spec["name"] for spec in self._required}
         return r
 
     def _update_validation(self) -> None:
@@ -410,4 +448,8 @@ class BugDialog(QDialog):
             self.iteration.setCurrentText(loaded.iteration_path)
             self.assigned.setText(loaded.assigned_to)
             self.tags.setText(", ".join(loaded.tags))
+            self._config_extras = dict(loaded.extra_fields)
+            for ref, widget in self._extra_widgets.items():
+                value = loaded.extra_fields.get(ref, "")
+                widget.setCurrentText(value) if isinstance(widget, QComboBox) else widget.setText(value)
             self._update_validation()

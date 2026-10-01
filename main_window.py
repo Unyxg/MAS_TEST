@@ -949,6 +949,9 @@ class MainWindow(QMainWindow):
         report.assigned_to = str(self.bug_cfg.get("default_assigned_to") or "")
         report.severity = str(self.bug_cfg.get("default_severity") or report.severity)
         report.extra_fields = {str(k): str(v) for k, v in (self.bug_cfg.get("extra_fields") or {}).items()}
+        # Pre-fill a required field from config only if the project really asks for it.
+        for spec in (self.bug_meta or {}).get("required_custom", []):
+            report.required_extra[spec["ref"]] = spec["name"]
         report.tags = list(dict.fromkeys([*(self.bug_cfg.get("tags") or ["MAS-QA-Bridge"]), *(
             [session.point.configuration] if session and session.point.configuration else [])]))
         return report

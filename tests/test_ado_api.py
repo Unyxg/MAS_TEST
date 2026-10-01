@@ -166,3 +166,27 @@ def test_unknown_project_is_diagnosed_with_the_real_names(client):
     assert checks[0][1] is False
     assert checks[1][0] == "Projects visible to this token" and checks[1][1] is False
     assert "Orders Portal" in checks[1][2] and "NOT one of them" in checks[1][2]
+
+
+def test_project_required_fields_are_discovered_and_system_ones_ignored(client):
+    names = [f["name"] for f in client.required_user_fields()]
+    assert names == ["Detected in Phase", "Requirement Add On"]  # not Area ID, Value Area, Title, State...
+    detected = client.required_user_fields()[0]
+    assert detected["allowed"] == ["Development", "System Test", "UAT", "Production"]
+    assert client.bug_metadata()["required_custom"] == client.required_user_fields()
+
+
+def test_required_fields_missing_is_a_warning_and_values_are_sent(client, tmp_path):
+    session = _executed_session(client, tmp_path)
+    report = BugReport.from_session(session, 5, {}, "2.4.1")
+    report.assigned_to = "dev@x.com"
+    report.required_extra = {"Custom.DetectedInPhase": "Detected in Phase", "Custom.RequirementAddOn": "Requirement Add On"}
+    errors, warnings = report.validate()
+    assert errors == [] and any("Detected in Phase" in w and "Requirement Add On" in w for w in warnings)
+
+    report.extra_fields = {"Custom.DetectedInPhase": "UAT", "Custom.RequirementAddOn": "n/a"}
+    assert not any("Your project requires" in w for w in report.validate()[1])
+    client.create_bug(report)
+    ops = next(body for m, p, body in client.calls if p == "wit/workitems/$Bug")
+    fields = {op["path"]: op["value"] for op in ops if op["path"].startswith("/fields/")}
+    assert fields["/fields/Custom.DetectedInPhase"] == "UAT" and fields["/fields/Custom.RequirementAddOn"] == "n/a"

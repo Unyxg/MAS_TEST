@@ -49,6 +49,7 @@ class BugReport:
     assigned_to: str = ""
     tags: list[str] = field(default_factory=lambda: ["MAS-QA-Bridge"])
     extra_fields: dict[str, str] = field(default_factory=dict)  # custom required fields, by reference name
+    required_extra: dict[str, str] = field(default_factory=dict)  # reference name -> label, required by the project
 
     summary: str = ""
     preconditions: str = ""
@@ -134,6 +135,11 @@ class BugReport:
             warnings.append("Expected result is empty.")
         if not self.found_in.strip():
             warnings.append("'Found in build' is empty - developers need the application version.")
+        missing = [label for ref, label in self.required_extra.items() if not str(self.extra_fields.get(ref, "")).strip()]
+        if missing:
+            warnings.append(
+                "Your project requires: " + ", ".join(missing) + " - leave empty only if Azure DevOps fills it automatically."
+            )
         if not self.assigned_to.strip():
             warnings.append("'Assigned to' is empty - set bug.default_assigned_to in config.yaml.")
         if not self.attachments:
