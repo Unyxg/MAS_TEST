@@ -74,12 +74,54 @@ RUN_AS_CHOICES = [
 log = logging.getLogger(APP_NAME)
 
 
+class ConfigError(Exception):
+    """config.yaml cannot be read; the message is written for the tester, not the developer."""
+
+
+def _describe_yaml_error(path: Path, exc: yaml.YAMLError) -> str:
+    mark = getattr(exc, "problem_mark", None)
+    where, shown = "", ""
+    if mark is not None:
+        line_no, col = mark.line + 1, mark.column + 1
+        where = f" (line {line_no}, column {col})"
+        try:
+            text = path.read_text(encoding="utf-8").splitlines()[mark.line]
+        except (OSError, IndexError):
+            text = ""
+        # Never echo secrets: hide whatever follows a "pat:" / "password:" key.
+        key = text.split(":", 1)[0].strip().lower()
+        if key in {"pat", "password"}:
+            text = text.split(":", 1)[0] + ": ****"
+        if text:
+            shown = f"\n\nLine {line_no} reads:\n    {text.strip()[:120]}"
+    return (
+        f"{path.name} has a formatting mistake{where}.{shown}\n\n"
+        "Common causes:\n"
+        "  • A value typed AFTER the closing quote. Put it BETWEEN the quotes:  pat: \"your-token\"\n"
+        "  • A TAB character (use spaces only), or a missing quote.\n"
+        "  • A Windows path in double quotes with single backslashes - use / or \\\\ , e.g. \"C:/Program Files/App/app.exe\".\n\n"
+        "Tip: you do not have to put the token in the file at all - set the ADO_PAT environment variable instead.\n\n"
+        f"File: {path}\n\n"
+        "Fix the line and start MAS-QA-Bridge again (or delete the file to start from the defaults)."
+    )
+
+
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     if not path.exists():
         log.warning("Config file %s not found - using defaults", path)
         return {}
-    with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+    try:
+        with open(path, encoding="utf-8-sig") as fh:  # utf-8-sig: tolerate the BOM Notepad can add
+            data = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        raise ConfigError(_describe_yaml_error(path, exc)) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path.name} is not saved as UTF-8 text ({exc.reason}). Re-save it as UTF-8.\n\nFile: {path}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path.name} must contain settings like 'ado:' and 'app:' (found {type(data).__name__}).\n\nFile: {path}")
+    return data
 
 
 # ----------------------------------------------------------------------------
@@ -1033,7 +1075,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         from demo_data import DemoAdoClient
 
         client = DemoAdoClient()
-    window = MainWindow(load_config(args.config), ado_client=client, demo=args.demo)
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        log.error("%s", exc)
+        QMessageBox.critical(None, f"{APP_NAME} - settings file problem", str(exc))
+        return 2
+    window = MainWindow(config, ado_client=client, demo=args.demo)
     if args.demo:
         from demo_data import DemoAppWidget
 

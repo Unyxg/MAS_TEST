@@ -33,11 +33,11 @@ def run_self_test(base_dir: Path, config_path: Path) -> int:
     lines.append(f"frozen={getattr(sys, 'frozen', False)} base_dir={base_dir}")
 
     def config() -> str:
-        import yaml
-
         if not config_path.exists():
             return f"{config_path} not found (defaults will be used)"
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        from main_window import load_config
+
+        data = load_config(config_path)
         return f"{config_path.name} sections: {', '.join(data)}"
 
     def qt() -> str:

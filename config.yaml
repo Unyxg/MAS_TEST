@@ -2,6 +2,13 @@
 # ---------------------------------------------------------------------------
 # Do NOT commit a real PAT. Leave `pat` empty and set the ADO_PAT environment
 # variable instead (it takes precedence over this file).
+#
+# EDITING RULES (YAML):
+#   * Put values BETWEEN the quotes:      pat: "your-token"      (not  pat: ""  your-token)
+#   * Indent with spaces, never tabs.
+#   * Windows paths: use SINGLE quotes or forward slashes:
+#         default_executable: 'C:\Program Files\MyApp\MyApp.exe'
+#         default_executable: "C:/Program Files/MyApp/MyApp.exe"
 
 ado:
   organization: "your-organization"      # https://dev.azure.com/<organization>
@@ -31,7 +38,7 @@ bug:
   extra_fields: {}                       # custom required fields, e.g. {"Custom.Team": "Checkout"}
 
 app:
-  default_executable: ""                 # e.g. "C:/Program Files/MyApp/MyApp.exe"
+  default_executable: ""                 # e.g. 'C:\Program Files\MyApp\MyApp.exe'  (single quotes!)
   launch_args: []                        # e.g. ["--test-mode"]
   window_title_contains: ""              # optional filter to skip splash screens
   window_find_timeout_seconds: 20
