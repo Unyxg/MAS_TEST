@@ -85,6 +85,7 @@ class AdoConfig:
     step_attachments: bool = True  # attach step screenshots to the step itself
     timeout: float = 30.0
     verify_ssl: bool = True
+    pat_source: str = ""  # where the token came from (never the token itself)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AdoConfig":
@@ -94,12 +95,25 @@ class AdoConfig:
         otherwise from the config file.
         """
         data = dict(data or {})
-        pat = os.environ.get("ADO_PAT") or data.get("pat") or ""
+        env_pat = (os.environ.get("ADO_PAT") or "").strip()
+        pat = env_pat or str(data.get("pat") or "").strip()
+        pat_source = "the ADO_PAT environment variable" if env_pat else "config.yaml"
         missing = [k for k in ("organization", "project") if not str(data.get(k) or "").strip()]
         if not pat:
             missing.append("pat (or ADO_PAT env var)")
         if missing:
             raise ValueError(f"Missing ADO settings: {', '.join(missing)}")
+        placeholders = [
+            f"{key}: \"{data[key]}\""
+            for key, example in (("organization", "your-organization"), ("project", "Your Project"))
+            if str(data[key]).strip().lower() == example.lower()
+        ]
+        if placeholders:
+            raise ValueError(
+                "config.yaml still has the example value(s) " + ", ".join(placeholders)
+                + ". Set ado.organization (the name in https://dev.azure.com/<organization>) and "
+                "ado.project to your real ones."
+            )
 
         plan_id = data.get("test_plan_id")
         return cls(
@@ -115,6 +129,7 @@ class AdoConfig:
             step_attachments=bool(data.get("step_attachments", True)),
             timeout=float(data.get("timeout_seconds") or cls.timeout),
             verify_ssl=bool(data.get("verify_ssl", True)),
+            pat_source=pat_source,
         )
 
 
@@ -270,11 +285,7 @@ class AdoTestClient:
         # A bad/expired PAT yields 401, or 203 + an HTML sign-in page.
         resp_type = resp.headers.get("Content-Type", "")
         if resp.status_code in (401, 203) or (resp.ok and "text/html" in resp_type):
-            raise AdoError(
-                "Authentication failed - check the PAT value, expiry and scopes "
-                "(Test Management: Read & write, Work Items: Read & write).",
-                resp.status_code,
-            )
+            raise AdoError(self._auth_help(resp.status_code, url), resp.status_code)
         if not resp.ok:
             try:
                 detail = resp.json().get("message", resp.text)
@@ -282,6 +293,26 @@ class AdoTestClient:
                 detail = resp.text
             raise AdoError(f"{method} {url} -> HTTP {resp.status_code}: {detail[:500]}", resp.status_code)
         return resp
+
+    def _auth_help(self, status: int, url: str) -> str:
+        """Explain a rejected request: what was used, and the usual causes (never the token itself)."""
+        c = self.config
+        host = url.split("/_apis/")[0]
+        return (
+            f"Azure DevOps rejected the sign-in (HTTP {status}).\n\n"
+            f"Address used:   {host}\n"
+            f"Organization:   {c.organization}\n"
+            f"Project:        {c.project}\n"
+            f"Token read from: {c.pat_source or 'unknown'} ({len(c.pat)} characters)\n\n"
+            "Check, in this order:\n"
+            "1. The organization/project above are the real ones (config.yaml, ado: section).\n"
+            "2. The token was created for THIS organization, has not expired, and has the scopes "
+            "Test Management (Read & write) and Work Items (Read & write).\n"
+            "3. A real token is about 52 characters. If the number above is very different, the "
+            "ADO_PAT variable holds something else - set it again, then restart Windows Explorer "
+            "or sign out/in so double-clicked programs see it.\n"
+            "4. If your company uses an Azure DevOps Server (on-premises), set ado.base_url."
+        )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         resp = self._send(method, path, **kwargs)

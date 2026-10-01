@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ado_test_api import AdoConfig, AdoError, html_to_text, parse_steps_xml  # noqa: E402
+from ado_test_api import AdoConfig, AdoError, AdoTestClient, html_to_text, parse_steps_xml  # noqa: E402
 from bug_report import BugReport  # noqa: E402
 from demo_data import DemoAdoClient  # noqa: E402
 from qa_session import EvidenceItem  # noqa: E402
@@ -124,3 +124,20 @@ def test_config_prefers_env_pat(monkeypatch):
     monkeypatch.setenv("ADO_PAT", "from-env")
     cfg = AdoConfig.from_dict({"organization": "o", "project": "p", "pat": "from-file"})
     assert cfg.pat == "from-env"
+
+
+def test_placeholder_organization_is_explained(monkeypatch):
+    monkeypatch.setenv("ADO_PAT", "x" * 52)
+    with pytest.raises(ValueError, match="example value"):
+        AdoConfig.from_dict({"organization": "your-organization", "project": "Real Project"})
+    with pytest.raises(ValueError, match="example value"):
+        AdoConfig.from_dict({"organization": "adient", "project": "Your Project"})
+
+
+def test_auth_error_names_what_was_used_but_never_the_token(monkeypatch):
+    token = "SECRETTOKEN" + "a" * 41
+    monkeypatch.setenv("ADO_PAT", token)
+    client = AdoTestClient(AdoConfig.from_dict({"organization": "adient", "project": "My Project"}))
+    message = client._auth_help(401, "https://dev.azure.com/adient/My%20Project/_apis/test/runs")
+    assert "adient" in message and "ADO_PAT environment variable" in message and "(52 characters)" in message
+    assert token not in message and "SECRETTOKEN" not in message
