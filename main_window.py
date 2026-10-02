@@ -61,6 +61,10 @@ if IS_WINDOWS:
     import win32gui
 
 APP_NAME = "MAS-QA-Bridge"
+try:  # written by the Windows build workflow; absent when running from source
+    from build_info import COMMIT as BUILD_ID
+except ImportError:
+    BUILD_ID = ""
 # Frozen (PyInstaller) builds keep config.yaml and temp_evidence next to the .exe.
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -237,7 +241,10 @@ class MainWindow(QMainWindow):
         self.is_admin = run_as.is_admin()
         self._force_close = False
         self.setWindowTitle(
-            APP_NAME + (" — DEMO" if self.demo else "") + (" (Administrator)" if self.is_admin else "")
+            APP_NAME
+            + (" — DEMO" if self.demo else "")
+            + (" (Administrator)" if self.is_admin else "")
+            + (f"  ·  build {BUILD_ID}" if BUILD_ID else "")
         )
         self.resize(1680, 980)
         self.setStyleSheet(STYLESHEET)

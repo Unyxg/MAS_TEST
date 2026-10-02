@@ -16,6 +16,8 @@ A PyQt6 desktop workbench for **manual testing of Windows applications with Azur
 
 ## Download the Windows app
 
+The window title shows the **build id** (for example `build 56d0331`). It matches the commit of the workflow run you downloaded, so you can tell which version you are running.
+
 Every push runs the **Windows build** workflow (`.github/workflows/windows-build.yml`) on a real Windows machine. It:
 
 1. runs the unit tests,
@@ -141,6 +143,7 @@ It only sends fields that exist in your project's process (Agile, Scrum and CMMI
 | Message | Cause and fix |
 |---|---|
 | "config.yaml still has the example value(s)" | Set `ado.organization` (the name in `https://dev.azure.com/<organization>`) and `ado.project`. |
+| "TF401320: Rule Error for field <name>" when submitting a bug | Your project requires that field. The form adds it (highlighted, with the allowed values) so you can fill it in and submit again, and your report is kept as a draft. The form also asks for every required field up front. **Check ADO** lists them with their reference names, so a value you always use can go in `bug.extra_fields`. |
 | "Not found: check ado.organization, ado.project and ado.base_url" | The **project** is the name right after the organization in your address (`https://dev.azure.com/<organization>/<PROJECT>` or `https://<organization>.visualstudio.com/<PROJECT>`). A test plan or team name is not a project. **Check ADO** lists the projects your token can see when it can. |
 | "Azure DevOps rejected the sign-in" | The message lists the organization, project and where the token was read from (with its length, never the token). Check these in order: right organization and project, token not expired and created for that organization, scopes *Test Management* and *Work Items* (Read & write). |
 | The token length shown is not about 52 | `ADO_PAT` holds something else. Set it again with `setx ADO_PAT "<token>"`. |

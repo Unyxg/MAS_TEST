@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ado_test_api import hidden_error_count, rule_error_fields
 from bug_report import IMAGE_SUFFIXES, PRIORITIES, REPRODUCIBILITY, SEVERITIES, BugReport
 
 
@@ -160,33 +161,19 @@ class BugDialog(QDialog):
         root.addLayout(grid)
 
         # ---- fields the project's rules require (custom fields: e.g. "Detected in Phase")
-        self._required = list(self.meta.get("required_custom") or [])
+        self._required: list[dict[str, Any]] = []
         self._config_extras = dict(report.extra_fields)
         self._extra_widgets: dict[str, QWidget] = {}
-        if self._required:
-            title = QLabel("REQUIRED BY YOUR PROJECT")
-            title.setObjectName("panelTitle")
-            root.addWidget(title)
-            extra_grid = QGridLayout()
-            extra_grid.setHorizontalSpacing(12)
-            extra_grid.setVerticalSpacing(6)
-            for i, spec in enumerate(self._required):
-                caption = QLabel(spec["name"] + " *")
-                caption.setObjectName("muted")
-                current = self._config_extras.get(spec["ref"], "")
-                if spec["allowed"]:
-                    widget: QWidget = QComboBox()
-                    widget.addItem("")  # force a conscious choice
-                    widget.addItems(spec["allowed"])
-                    widget.setCurrentText(current)
-                else:
-                    widget = QLineEdit(current)
-                if spec.get("help"):
-                    widget.setToolTip(spec["help"])
-                self._extra_widgets[spec["ref"]] = widget
-                extra_grid.addWidget(caption, (i // 4) * 2, i % 4)
-                extra_grid.addWidget(widget, (i // 4) * 2 + 1, i % 4)
-            root.addLayout(extra_grid)
+        self._extra_title = QLabel("REQUIRED BY YOUR PROJECT")
+        self._extra_title.setObjectName("panelTitle")
+        self._extra_title.hide()
+        root.addWidget(self._extra_title)
+        self._extra_grid = QGridLayout()
+        self._extra_grid.setHorizontalSpacing(12)
+        self._extra_grid.setVerticalSpacing(6)
+        root.addLayout(self._extra_grid)
+        for spec in self.meta.get("required_custom") or []:
+            self.add_required_field(spec)
 
         # ---- tabs
         self.tabs = QTabWidget()
@@ -232,10 +219,47 @@ class BugDialog(QDialog):
             edit.textChanged.connect(self._update_validation)
         for edit in (self.steps_edit, self.actual_edit, self.expected_edit):
             edit.textChanged.connect(self._update_validation)
-        for widget in self._extra_widgets.values():
-            (widget.currentTextChanged if isinstance(widget, QComboBox) else widget.textChanged).connect(
-                self._update_validation
-            )
+        self._update_validation()
+
+    def add_required_field(self, spec: dict[str, Any], highlight: bool = False) -> bool:
+        """Add an input for a field the project requires. Returns False if it is already shown."""
+        ref = spec["ref"]
+        if ref in self._extra_widgets:
+            if highlight:
+                self._mark(self._extra_widgets[ref])
+            return False
+        i = len(self._required)
+        self._required.append(spec)
+        caption = QLabel(spec["name"] + " *")
+        caption.setObjectName("muted")
+        current = self._config_extras.get(ref, "") or spec.get("default", "")
+        if spec["allowed"]:
+            widget: QWidget = QComboBox()
+            widget.addItem("")  # no silent guess: an empty choice is flagged before submitting
+            widget.addItems(spec["allowed"])
+            widget.setCurrentText(current)
+            widget.currentTextChanged.connect(self._update_validation)
+        else:
+            widget = QLineEdit(current)
+            widget.textChanged.connect(self._update_validation)
+        widget.setToolTip((spec.get("help") or "") + (f"\n[{ref}]" if ref else ""))
+        self._extra_widgets[ref] = widget
+        self._extra_grid.addWidget(caption, (i // 4) * 2, i % 4)
+        self._extra_grid.addWidget(widget, (i // 4) * 2 + 1, i % 4)
+        self._extra_title.show()
+        if highlight:
+            self._mark(widget)
+        return True
+
+    @staticmethod
+    def _mark(widget: QWidget) -> None:
+        """Flag a field Azure DevOps rejected (red border until the next edit)."""
+        widget.setStyleSheet("border: 1px solid #ff7b72;")
+        if isinstance(widget, QComboBox):
+            widget.currentTextChanged.connect(lambda _t: widget.setStyleSheet(""))
+        else:
+            widget.textChanged.connect(lambda _t: widget.setStyleSheet(""))
+        widget.setFocus()
 
     def _fit_to_screen(self) -> None:
         screen = (self.parent().screen() if self.parent() is not None else None) or QApplication.primaryScreen()
@@ -473,18 +497,52 @@ class BugDialog(QDialog):
             self.message.setText("Uploading evidence and creating the bug…")
 
     def submission_failed(self, error: str) -> None:
-        """Keep the form open, explain the error and keep a draft on disk."""
+        """Keep the form open, explain the error, add any field Azure DevOps rejected, keep a draft."""
         draft = self.collect().save_draft(self.drafts_dir, error)
         self.set_busy(False)
+        named = rule_error_fields(error)
+        hidden = hidden_error_count(error)
         hint = ""
-        if "Rule Error" in error or "TF401320" in error:
-            hint = "<br>A field value was rejected by your project's rules - check Area path, Iteration and Severity."
-        elif "Authentication" in error:
-            hint = "<br>Check the PAT has <b>Work Items: Read &amp; write</b>."
+        if named:
+            added, unknown = [], []
+            for name in named:
+                spec = (self.meta.get("fields_by_name") or {}).get(name.lower())
+                if spec is None:
+                    unknown.append(name)
+                elif self.add_required_field(spec, highlight=True):
+                    added.append(spec["name"])
+                else:
+                    self.add_required_field(spec, highlight=True)  # already shown: just flag it
+            if hidden:
+                # Azure DevOps reports only the first problem: show every required field so none stays hidden.
+                for spec in (self.meta.get("all_required") or []):
+                    if self.add_required_field(spec):
+                        added.append(spec["name"])
+            parts = [f"Azure DevOps rejected <b>{', '.join(named)}</b>."]
+            if added:
+                parts.append(f"Added to the form: <b>{', '.join(dict.fromkeys(added))}</b> - fill in the highlighted field(s) and submit again.")
+            if unknown:
+                parts.append(f"'{', '.join(unknown)}' is not a field this app knows - add it under bug.extra_fields in config.yaml (run Check ADO to see the field names).")
+            if hidden and not added:
+                parts.append(f"{hidden} more problem(s) were not named by Azure DevOps; check Area path, Iteration and the other fields.")
+            hint = "<br><span style='color:#ff7b72'>" + " ".join(parts) + "</span>"
+            self.tabs.setCurrentIndex(0)
+            self._scroll.verticalScrollBar().setValue(0)
+        elif "Rule Error" in error or "TF401320" in error:
+            hint = "<br><span style='color:#ff7b72'>A field value was rejected by your project's rules - check Area path, Iteration, Severity and the required fields.</span>"
+        elif "Authentication" in error or "rejected the sign-in" in error:
+            hint = "<br><span style='color:#ff7b72'>Check the token has <b>Work Items: Read &amp; write</b>.</span>"
+        technical = error.split("\n")[0]
+        if len(technical) > 230:
+            technical = technical[:230] + "…"
+        self.message.setToolTip(error)
         self.message.setText(
-            f"<span style='color:#ff7b72'>✖ Bug not created: {error}</span>{hint}"
-            f"<br><span style='color:#9199a5'>Draft saved: {draft}</span>"
+            "<span style='color:#ff7b72'><b>✖ Bug not created.</b></span>"
+            + (hint or "<br><span style='color:#ff7b72'>Azure DevOps refused it - details below.</span>")
+            + f"<br><span style='color:#9199a5'>Draft saved: {draft}</span>"
+            + f"<br><span style='color:#9199a5'>Technical detail: {technical}</span>"
         )
+        self.message.adjustSize()
 
     def submission_succeeded(self, result: dict[str, Any]) -> None:
         self.created_bug = result

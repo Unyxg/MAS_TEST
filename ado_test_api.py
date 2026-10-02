@@ -225,6 +225,21 @@ def parse_steps_xml(
     return steps
 
 
+def rule_error_fields(message: str) -> list[str]:
+    """Display names of the fields named in 'TF401320: Rule Error for field <name>. Error code: ...'."""
+    return [m.strip() for m in re.findall(r"Rule Error for field (.+?)\.\s*Error code", message or "")]
+
+
+def hidden_error_count(message: str) -> int:
+    """Azure DevOps reports only the first rule error plus 'N additional error(s) occurred'."""
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    m = re.search(r"(\w+) additional errors? occurred", message or "", re.I)
+    if not m:
+        return 0
+    token = m.group(1).lower()
+    return words.get(token) or (int(token) if token.isdigit() else 1)
+
+
 # ----------------------------------------------------------------------------
 # Client
 # ----------------------------------------------------------------------------
@@ -642,25 +657,55 @@ class AdoTestClient:
         "Microsoft.VSTS.TCM.ReproSteps",
         "Microsoft.VSTS.TCM.SystemInfo",
         "Microsoft.VSTS.Build.FoundIn",
+        "System.Title",
+        "System.State",
+        "System.Reason",
+        "System.AreaPath",
+        "System.AreaId",
+        "System.IterationPath",
+        "System.IterationId",
+        "System.AssignedTo",
+        "System.Tags",
+        "System.Description",
+        "System.WorkItemType",
+        "System.TeamProject",
     }
+
+    @staticmethod
+    def _field_spec(ref: str, meta: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ref": ref,
+            "name": meta["name"],
+            "allowed": meta["allowed"],
+            "default": meta.get("default") or "",
+            "help": meta.get("help", ""),
+            "required": meta["required"],
+        }
 
     def required_user_fields(self, work_item_type: str = "Bug") -> list[dict[str, Any]]:
         """Fields the project's rules require a person to fill in (beyond the standard ones).
 
-        These are ``alwaysRequired`` fields without a default value, other than
-        System.* fields (title, state, area/iteration ids...) which are managed
-        by Azure DevOps or by this app.
+        Every ``alwaysRequired`` field the app does not fill itself - including fields that have a
+        default value: Azure DevOps does not reliably apply a default when a work item is created
+        through the REST API, and then rejects the empty required field. A default is offered as the
+        pre-selected value. Unknown ``System.*`` fields with a default are treated as managed.
         """
         out = []
         for ref, meta in self.get_work_item_type_fields(work_item_type).items():
-            if (
-                meta["required"]
-                and meta.get("default") in (None, "")
-                and not ref.startswith("System.")
-                and ref not in self._HANDLED_FIELDS
-            ):
-                out.append({"ref": ref, "name": meta["name"], "allowed": meta["allowed"], "help": meta.get("help", "")})
+            if not meta["required"] or ref in self._HANDLED_FIELDS:
+                continue
+            if ref.startswith("System.") and meta.get("default") not in (None, ""):
+                continue  # system-managed
+            out.append(self._field_spec(ref, meta))
         return sorted(out, key=lambda f: f["name"].lower())
+
+    def find_field_by_name(self, display_name: str, work_item_type: str = "Bug") -> Optional[dict[str, Any]]:
+        """Field spec by its display name (as used in Azure DevOps error messages), case-insensitive."""
+        wanted = display_name.strip().lower()
+        for ref, meta in self.get_work_item_type_fields(work_item_type).items():
+            if meta["name"].strip().lower() == wanted or ref.lower() == wanted:
+                return self._field_spec(ref, meta)
+        return None
 
     def bug_metadata(self, work_item_type: str = "Bug") -> dict[str, Any]:
         """Everything the bug form needs: severity values, areas, iterations, required fields."""
@@ -673,6 +718,8 @@ class AdoTestClient:
             "iterations": self.list_classification_paths("iterations"),
             "required": sorted(m["name"] for m in fields.values() if m["required"]),
             "required_custom": self.required_user_fields(work_item_type),
+            "fields_by_name": {m["name"].strip().lower(): self._field_spec(ref, m) for ref, m in fields.items()},
+            "all_required": self.required_user_fields(work_item_type),
             "fields": set(fields),
         }
 
@@ -838,6 +885,19 @@ class AdoTestClient:
             lambda: f"{len(self.get_work_item_type_fields(work_item_type))} fields; required: "
             + ", ".join(sorted(m['name'] for m in self.get_work_item_type_fields(work_item_type).values() if m['required'])),
         )
+
+        def asked() -> str:
+            specs = self.required_user_fields(work_item_type)
+            if not specs:
+                return "none beyond the standard ones"
+            return "<br>".join(
+                f"{f['name']} <i>({f['ref']})</i>"
+                + (f" - choose from {len(f['allowed'])}: " + ", ".join(f["allowed"][:6]) + ("…" if len(f["allowed"]) > 6 else "") if f["allowed"] else " - free text")
+                + (f" - default: {f['default']}" if f["default"] else "")
+                for f in specs
+            )
+
+        check("Extra required fields the bug form asks for", asked)
         check("Area paths", lambda: f"{len(self.list_classification_paths('areas'))} found")
         check("Iteration paths", lambda: f"{len(self.list_classification_paths('iterations'))} found")
         checks.append(

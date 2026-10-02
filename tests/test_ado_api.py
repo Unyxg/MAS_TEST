@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ado_test_api import AdoConfig, AdoError, AdoTestClient, html_to_text, parse_steps_xml  # noqa: E402
+from ado_test_api import AdoConfig, AdoError, AdoTestClient, hidden_error_count, html_to_text, parse_steps_xml, rule_error_fields  # noqa: E402
 from bug_report import BugReport  # noqa: E402
 from demo_data import DemoAdoClient  # noqa: E402
 from qa_session import EvidenceItem  # noqa: E402
@@ -170,9 +170,11 @@ def test_unknown_project_is_diagnosed_with_the_real_names(client):
 
 def test_project_required_fields_are_discovered_and_system_ones_ignored(client):
     names = [f["name"] for f in client.required_user_fields()]
-    assert names == ["Detected in Phase", "Requirement Add On"]  # not Area ID, Value Area, Title, State...
-    detected = client.required_user_fields()[0]
-    assert detected["allowed"] == ["Development", "System Test", "UAT", "Production"]
+    # Fields with a default are included too (Created by Team); not Area ID, Value Area, Title, State...
+    assert names == ["Created by Team", "Detected in Phase", "Requirement Add On"]
+    by_name = {f["name"]: f for f in client.required_user_fields()}
+    assert by_name["Created by Team"]["default"] == "Platform"
+    assert by_name["Detected in Phase"]["allowed"] == ["Development", "System Test", "UAT", "Production"]
     assert client.bug_metadata()["required_custom"] == client.required_user_fields()
 
 
@@ -190,3 +192,28 @@ def test_required_fields_missing_is_a_warning_and_values_are_sent(client, tmp_pa
     ops = next(body for m, p, body in client.calls if p == "wit/workitems/$Bug")
     fields = {op["path"]: op["value"] for op in ops if op["path"].startswith("/fields/")}
     assert fields["/fields/Custom.DetectedInPhase"] == "UAT" and fields["/fields/Custom.RequirementAddOn"] == "n/a"
+
+
+REAL_ERROR = (
+    "POST https://dev.azure.com/adient/IT-MFG-MIRA/_apis/wit/workitems/$Bug -> HTTP 400: TF401320: Rule Error for "
+    "field Created by Team. Error code: Required, HasValues, LimitedToValues, AllowsOldValue, InvalidEmpty. "
+    "One additional error occurred during validation of the work item. Please correct all errors and try again."
+)
+
+
+def test_rule_error_parsing_uses_the_real_message():
+    assert rule_error_fields(REAL_ERROR) == ["Created by Team"]
+    assert hidden_error_count(REAL_ERROR) == 1
+    assert hidden_error_count("2 additional errors occurred") == 2
+    assert rule_error_fields("something else") == [] and hidden_error_count("") == 0
+
+
+def test_field_lookup_by_display_name(client):
+    spec = client.find_field_by_name("created by team")
+    assert spec["ref"] == "Custom.CreatedByTeam" and spec["allowed"] == ["Platform", "Checkout", "Reporting"]
+    assert client.find_field_by_name("No Such Field") is None
+
+
+def test_diagnostics_list_required_fields_with_reference_names(client):
+    row = next(detail for name, ok, detail in client.run_diagnostics() if name.startswith("Extra required"))
+    assert "Custom.CreatedByTeam" in row and "Custom.DetectedInPhase" in row and "default: Platform" in row

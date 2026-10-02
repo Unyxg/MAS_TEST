@@ -30,7 +30,11 @@ def run_self_test(base_dir: Path, config_path: Path) -> int:
             lines.append(f"FAIL  {name}: {exc}\n{traceback.format_exc()}")
 
     lines.append(f"MAS-QA-Bridge self-test · Python {platform.python_version()} · {platform.platform()}")
-    lines.append(f"frozen={getattr(sys, 'frozen', False)} base_dir={base_dir}")
+    try:
+        from build_info import COMMIT as build_id
+    except ImportError:
+        build_id = "(source)"
+    lines.append(f"frozen={getattr(sys, 'frozen', False)} build={build_id} base_dir={base_dir}")
 
     def config() -> str:
         if not config_path.exists():

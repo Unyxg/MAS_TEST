@@ -28,6 +28,7 @@ a = Analysis(
         "imageio.config.extensions",
         # imported lazily inside functions
         "main_window",
+        "build_info",
         "demo_data",
         "self_test",
         "win32cred",

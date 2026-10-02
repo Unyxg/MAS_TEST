@@ -39,6 +39,12 @@ jobs:
           SMOKE_OUT: smoke_out
         run: python tests/windows_smoke.py
 
+      - name: Stamp the build id (shown in the window title)
+        shell: pwsh
+        run: |
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          "COMMIT = '$sha'" | Set-Content -Path build_info.py -Encoding ascii
+
       - name: Build MAS-QA-Bridge.exe
         run: pyinstaller --noconfirm packaging/mas_qa_bridge.spec
 

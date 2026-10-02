@@ -128,6 +128,13 @@ BUG_FIELDS = [
         "allowedValues": ["Development", "System Test", "UAT", "Production"],
     },
     {"referenceName": "Custom.RequirementAddOn", "name": "Requirement Add On", "alwaysRequired": True},
+    {
+        "referenceName": "Custom.CreatedByTeam",
+        "name": "Created by Team",
+        "alwaysRequired": True,
+        "defaultValue": "Platform",  # a default does not stop Azure DevOps rejecting an empty value on REST create
+        "allowedValues": ["Platform", "Checkout", "Reporting"],
+    },
     {"referenceName": "System.AreaId", "name": "Area ID", "alwaysRequired": True},
     {"referenceName": "Microsoft.VSTS.Common.ValueArea", "name": "Value Area", "alwaysRequired": True},
     {"referenceName": "Microsoft.VSTS.TCM.ReproSteps", "name": "Repro Steps"},
