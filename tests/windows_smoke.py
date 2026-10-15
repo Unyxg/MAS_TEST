@@ -38,7 +38,12 @@ TARGET = r"C:\Windows\System32\notepad.exe"
 results: list[dict] = []
 
 
-def check(name: str, ok: object, detail: str = "") -> bool:
+def check(name: str, ok: object, detail: str = "", required: bool = True) -> bool:
+    """Record a check. ``required=False`` is an experiment: printed as OBSERVED, never fails the run."""
+    if not required:
+        print(f"OBSERVED  {name}: {'yes' if ok else 'no'}  {detail}", flush=True)
+        results.append({"check": name, "ok": True, "observed": bool(ok), "detail": detail})
+        return bool(ok)
     results.append({"check": name, "ok": bool(ok), "detail": detail})
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}", flush=True)
     return bool(ok)
@@ -177,7 +182,79 @@ def main() -> int:
         except PermissionError as exc:
             check("wrong password rejected", "incorrect" in str(exc), str(exc))
 
+    @section("modal popups opened by the embedded application")
+    def modal_popups() -> None:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        pythonw = str(Path(sys.executable).with_name("pythonw.exe"))
+        target = str(ROOT / "tests" / "modal_target.py")
+        root_hwnd = int(window.winId())
+
+        def find_popup() -> int:
+            found = []
+            pids = wm.candidate_pids()
+
+            def cb(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd) and win32gui.GetClassName(hwnd) == "#32770":
+                    if win32process.GetWindowThreadProcessId(hwnd)[1] in pids:
+                        found.append(hwnd)
+                return True
+
+            win32gui.EnumWindows(cb, None)
+            return found[0] if found else 0
+
+        def real_click(widget) -> None:
+            """A real mouse click through the OS (not a Qt-synthesised one), so a disabled window rejects it."""
+            centre = widget.mapToGlobal(widget.rect().center())
+            ratio = widget.devicePixelRatioF()
+            user32.SetCursorPos(int(centre.x() * ratio), int(centre.y() * ratio))
+            time.sleep(0.15)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
+            user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
+
+        cases = [("reparent", 0, False), ("reparent", 0, True), ("dock", 1, True)]
+        for mode_name, mode_index, guard in cases:
+            label = f"{mode_name}, guard {'on' if guard else 'OFF (experiment)'}"
+            (window._guard_timer.start if guard else window._guard_timer.stop)()
+            window.mode_combo.setCurrentIndex(mode_index)
+            pid = wm.launch(pythonw, args=[target, "--popup-after", "3500"])
+            hwnd = wm.find_window(timeout=30, title_contains="Modal Target")
+            window._embed_window(hwnd)
+            pump(app, 0.5)
+
+            popup = 0
+            deadline = time.monotonic() + 15
+            while not popup and time.monotonic() < deadline:
+                pump(app, 0.25)
+                popup = find_popup()
+            if not check(f"{label}: popup appears", popup):
+                wm.terminate()
+                continue
+            pump(app, 0.8)  # give the guard time to act
+
+            enabled = bool(win32gui.IsWindowEnabled(root_hwnd))
+            before = window.evidence_panel.list.count()
+            real_click(window.evidence_panel.shot_btn)
+            pump(app, 1.5)
+            clicked = window.evidence_panel.list.count() > before
+            required = guard  # without the guard it is an experiment (we expect it to be broken)
+            check(f"{label}: dashboard window is enabled while the popup is open", enabled, required=required)
+            check(f"{label}: real click on 'Screenshot' works while the popup is open", clicked, required=required)
+            desktop_png(f"4_popup_{mode_name}_guard_{'on' if guard else 'off'}")
+
+            win32gui.PostMessage(popup, win32con.WM_CLOSE, 0, 0)
+            pump(app, 1.0)
+            check(f"{label}: popup closes", not win32gui.IsWindow(popup) or not win32gui.IsWindowVisible(popup))
+            wm.terminate()
+            pump(app, 0.5)
+            if not win32gui.IsWindowEnabled(root_hwnd):  # leave the dashboard usable for the next case
+                win32gui.EnableWindow(root_hwnd, True)
+        window._guard_timer.start()
+        window.mode_combo.setCurrentIndex(0)
+
     current_user()
+    modal_popups()
     administrator()
     other_user()
     wrong_password()

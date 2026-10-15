@@ -20,6 +20,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -230,6 +231,14 @@ class MainWindow(QMainWindow):
         self._watchdog.setInterval(500)
         self._watchdog.timeout.connect(self._on_watchdog)
         self._watchdog.start()
+
+        # The embedded application's modal popups disable the dashboard (their owner's parent);
+        # keep it clickable. Cheap: one IsWindowEnabled call every 100 ms while embedded.
+        self._guard_timer = QTimer(self)
+        self._guard_timer.setInterval(100)
+        self._guard_timer.timeout.connect(self._keep_dashboard_usable)
+        self._guard_timer.start()
+        self._modal_logged_at = 0.0
 
         self._set_exe_path(self.exe_path)
         self._update_controls()
@@ -688,6 +697,14 @@ class MainWindow(QMainWindow):
         if self.window_manager.mode == "dock":
             self.window_manager.fit_to_host()
 
+    def _keep_dashboard_usable(self) -> None:
+        if self.window_manager.keep_dashboard_enabled():
+            now = time.monotonic()
+            if now - self._modal_logged_at > 10:
+                self._modal_logged_at = now
+                log.info("The application opened a modal popup - keeping the dashboard usable "
+                         "(if popups still misbehave, choose 'Dock (overlay)' in the header).")
+
     def _on_watchdog(self) -> None:
         wm = self.window_manager
         if wm.hwnd and not wm.window_exists():
@@ -1053,6 +1070,7 @@ class MainWindow(QMainWindow):
                 return
         self._region_timer.stop()
         self._watchdog.stop()
+        self._guard_timer.stop()
         if self.recorder.is_recording:
             self.recorder.stop()
         if str(self.app_cfg.get("on_exit", "release")).lower() == "terminate":

@@ -386,6 +386,29 @@ class WindowManager:
         except pywintypes.error as exc:
             log.debug("fit_to_host failed: %s", exc)
 
+    def keep_dashboard_enabled(self) -> bool:
+        """Undo the "disabled dashboard" caused by the embedded application's modal dialogs.
+
+        A modal dialog disables its owner's first non-child ancestor (MFC, Win32 ``DialogBox`` and
+        ``MessageBox`` do this). With the application embedded as a child, that ancestor is the
+        dashboard itself: it stops accepting clicks and beeps. The dialog stays modal for the
+        *application* (its own window remains disabled); only the dashboard is re-enabled.
+        Returns True when something had to be re-enabled. Only needed in embed (SetParent) mode:
+        in dock mode the application is a separate window, so the dashboard is never disabled.
+        """
+        if not (IS_WINDOWS and self.mode == "reparent" and self._saved and self.host_hwnd):
+            return False
+        changed = False
+        try:
+            top = win32gui.GetAncestor(self.host_hwnd, win32con.GA_ROOT)
+            for hwnd in (top, self.host_hwnd):
+                if hwnd and not win32gui.IsWindowEnabled(hwnd):
+                    win32gui.EnableWindow(hwnd, True)
+                    changed = True
+        except pywintypes.error:
+            pass
+        return changed
+
     def set_visible(self, visible: bool) -> None:
         """Hide/show a docked window (e.g. while the host frame is hidden)."""
         if self.window_exists() and self._saved:
