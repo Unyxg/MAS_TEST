@@ -225,6 +225,19 @@ def parse_steps_xml(
     return steps
 
 
+def parse_run_link(text: str) -> tuple[int, Optional[int]]:
+    """Run id (and result id, when given) from a Test Plans run address or 'run/result' / 'run' numbers."""
+    text = (text or "").strip()
+    run = re.search(r"[?&]runId=(\d+)", text, re.I) or re.search(r"/runs?/(\d+)", text, re.I)
+    result = re.search(r"[?&]resultId=(\d+)", text, re.I)
+    if run:
+        return int(run.group(1)), int(result.group(1)) if result else None
+    numbers = re.findall(r"\d+", text)
+    if len(numbers) in (1, 2) and re.fullmatch(r"[\d\s/,:#-]+", text):
+        return int(numbers[0]), int(numbers[1]) if len(numbers) == 2 else None
+    raise ValueError("Paste the run's address (it contains runId=…) or its run number.")
+
+
 def rule_error_fields(message: str) -> list[str]:
     """Display names of the fields named in 'TF401320: Rule Error for field <name>. Error code: ...'."""
     return [m.strip() for m in re.findall(r"Rule Error for field (.+?)\.\s*Error code", message or "")]
@@ -270,6 +283,18 @@ class AdoTestClient:
     def project_url(self) -> str:
         return f"{self.org_url}/{quote(self.config.project, safe='')}"
 
+    @property
+    def testresults_url(self) -> str:
+        """Base address of the Test Results service (step-level attachments live there).
+
+        Azure DevOps Services serves it from ``vstmr.dev.azure.com/<org>``; on-premises
+        Azure DevOps Server serves it from the normal collection address.
+        """
+        host = urlparse(self.config.base_url).hostname or ""
+        if host == "dev.azure.com" or host.endswith(".visualstudio.com"):
+            return f"https://vstmr.dev.azure.com/{quote(self.config.organization, safe='')}/{quote(self.config.project, safe='')}"
+        return self.project_url
+
     def run_web_url(self, run_id: int) -> str:
         return f"{self.project_url}/_testManagement/runs?_a=runCharts&runId={run_id}"
 
@@ -288,7 +313,7 @@ class AdoTestClient:
         api_version: Optional[str] = None,
         scope: str = "project",
     ) -> requests.Response:
-        base = self.org_url if scope == "org" else self.project_url
+        base = {"org": self.org_url, "testresults": self.testresults_url}.get(scope, self.project_url)
         url = f"{base}/_apis/{path.lstrip('/')}"
         query = {"api-version": api_version or self.config.api_version, **(params or {})}
         headers = {}
@@ -589,21 +614,31 @@ class AdoTestClient:
         iteration_id: Optional[int] = None,
         action_path: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Attach a file to a test result - or to one step of it (iteration + action path)."""
-        params = {}
-        if iteration_id is not None:
-            params["iterationId"] = iteration_id
-            if action_path:
-                params["actionPath"] = action_path
+        """Attach a file to a test result - or, with ``action_path``, to one step of it.
+
+        A step attachment must go through the *Test Results* service ("Create Test Iteration Result
+        Attachment", ``iterationId`` + ``actionPath``). The older Test service endpoint ignores those
+        parameters and attaches the file to the whole result.
+        """
+        body = self._attachment_body(file_path, comment, attachment_type)
+        if action_path:
+            data = self._request(
+                "POST",
+                f"testresults/runs/{run_id}/results/{result_id}/attachments",
+                json_body=body,
+                params={"iterationId": iteration_id or 1, "actionPath": action_path},
+                api_version=self.config.attachment_api_version,
+                scope="testresults",
+            )
+            log.info("Uploaded %s to step %s of result %s (run %s)", Path(file_path).name, action_path, result_id, run_id)
+            return data
         data = self._request(
             "POST",
             f"test/Runs/{run_id}/Results/{result_id}/attachments",
-            json_body=self._attachment_body(file_path, comment, attachment_type),
-            params=params,
+            json_body=body,
             api_version=self.config.attachment_api_version,
         )
-        where = f"step {action_path}" if action_path else f"result {result_id}"
-        log.info("Uploaded %s to %s of run %s", Path(file_path).name, where, run_id)
+        log.info("Uploaded %s to result %s of run %s", Path(file_path).name, result_id, run_id)
         return data
 
     # ------------------------------------------------------------------ bugs
@@ -910,33 +945,55 @@ class AdoTestClient:
         return checks
 
     # ------------------------------------------------------------ orchestration
-    def _upload_evidence(self, run_id: int, result_id: int, session: TestSession, comment: Optional[str]) -> list[str]:
-        uploaded = []
+    def _upload_evidence(
+        self, run_id: int, result_id: int, items: Iterable[EvidenceItem], comment: Optional[str]
+    ) -> tuple[list[str], list[str]]:
+        """Upload evidence; returns (descriptions of what was uploaded, warnings).
+
+        A file that cannot be uploaded is reported and skipped - it never undoes the published
+        result, and it stays in the evidence list so it can be attached again later. Files already
+        uploaded to this run are skipped.
+        """
+        uploaded: list[str] = []
+        warnings: list[str] = []
         target = self.config.attachment_target
-        for item in session.attachments():
+        for item in items:
+            if run_id in item.uploaded_to:
+                continue
             note = f"Step {item.step_number}" if item.step_number else (comment or None)
-            if target in ("result", "both"):
-                if item.step_action_path and self.config.step_attachments:
-                    try:
-                        self.upload_test_result_attachment(
-                            run_id, result_id, item.path, note, iteration_id=1, action_path=item.step_action_path
-                        )
-                    except AdoError as exc:
-                        log.warning("Step attachment rejected (%s) - attaching to the result instead", exc)
+            try:
+                to_step = False
+                if target in ("result", "both"):
+                    step_error: Optional[AdoError] = None
+                    if item.step_action_path and self.config.step_attachments:
+                        try:
+                            self.upload_test_result_attachment(
+                                run_id, result_id, item.path, note, iteration_id=1, action_path=item.step_action_path
+                            )
+                            to_step = True
+                        except AdoError as exc:
+                            step_error = exc
+                    if not to_step:
                         self.upload_test_result_attachment(run_id, result_id, item.path, note)
-                else:
-                    self.upload_test_result_attachment(run_id, result_id, item.path, note)
-            if target in ("run", "both"):
-                self.upload_test_run_attachment(run_id, item.path, note)
-            uploaded.append(item.path.name)
-        return uploaded
+                    if step_error is not None:  # reached only when the whole-test upload worked
+                        warnings.append(
+                            f"{item.path.name}: Azure DevOps refused the link to step {item.step_number} "
+                            f"({str(step_error).splitlines()[0][:160]}) - attached to the whole test result instead."
+                        )
+                if target in ("run", "both"):
+                    self.upload_test_run_attachment(run_id, item.path, note)
+                item.uploaded_to.add(run_id)
+                uploaded.append(f"{item.path.name} → " + (f"step {item.step_number}" if to_step else "whole test"))
+            except (AdoError, OSError) as exc:
+                warnings.append(f"{item.path.name}: not uploaded ({str(exc).splitlines()[0][:200]})")
+        return uploaded, warnings
 
     def record_execution(self, session: TestSession, outcome: str, comment: Optional[str] = None) -> dict[str, Any]:
-        """Publish a whole manual execution: run → evidence → step results → complete.
+        """Publish a whole manual execution: run → step results → evidence → complete.
 
-        Bugs already raised for this session are associated with the result.
-        If anything fails before the run is completed, the run is aborted so no
-        dangling "In progress" runs are left behind.
+        The step results are stored first, so the steps exist when evidence is linked to them.
+        Bugs already raised for this session are associated with the result. If anything fails
+        before the result is stored, the run is aborted so no "In progress" runs are left behind.
         """
         if outcome not in VALID_OUTCOMES:
             raise ValueError(f"Invalid outcome '{outcome}'")
@@ -949,7 +1006,6 @@ class AdoTestClient:
         run_id = int(run["id"])
         try:
             result_id = self._result_id_for_point(run_id, point.id)
-            uploaded = self._upload_evidence(run_id, result_id, session, comment)
             self.update_test_result(
                 run_id,
                 result_id,
@@ -959,10 +1015,15 @@ class AdoTestClient:
                 started_date=session.started_at,
                 iteration_details=[self.build_iteration(session, outcome, comment)] if session.steps else None,
             )
-            self.complete_test_run(run_id)
         except Exception:
             self.abort_test_run(run_id)
             raise
+
+        uploaded, warnings = self._upload_evidence(run_id, result_id, session.attachments(), comment)
+        try:
+            self.complete_test_run(run_id)
+        except AdoError as exc:
+            warnings.append(f"The run could not be marked completed ({str(exc).splitlines()[0][:160]}).")
 
         session.run_id, session.result_id = run_id, result_id
         for bug in session.bugs:
@@ -972,8 +1033,46 @@ class AdoTestClient:
             "result_id": result_id,
             "outcome": outcome,
             "attachments": uploaded,
+            "attachment_warnings": warnings,
             "url": self.run_web_url(run_id),
             "bugs": list(session.bugs),
+        }
+
+    # ----------------------------------------------- evidence for an already published run
+    def resolve_result_id(self, run_id: int) -> int:
+        """The result of a run that has exactly one result (runs made by this app have one)."""
+        results = self.get_test_results(run_id)
+        if len(results) != 1:
+            raise AdoError(
+                f"Run {run_id} has {len(results)} results - paste the link that contains '&resultId=…' "
+                "(open the result in the run's Test results tab and copy that address)."
+            )
+        return int(results[0]["id"])
+
+    def inspect_result(self, run_id: int, result_id: Optional[int] = None) -> dict[str, Any]:
+        """Describe a published result: its test case, outcome and run name (read-only)."""
+        result_id = result_id or self.resolve_result_id(run_id)
+        data = self._request("GET", f"test/Runs/{run_id}/results/{result_id}")
+        case = data.get("testCase") or {}
+        return {
+            "run_id": run_id,
+            "result_id": result_id,
+            "test_case_id": int(case["id"]) if str(case.get("id", "")).isdigit() else None,
+            "test_case_title": data.get("testCaseTitle") or case.get("name") or "",
+            "outcome": data.get("outcome", ""),
+            "run_name": (data.get("testRun") or {}).get("name", ""),
+            "url": self.run_web_url(run_id),
+        }
+
+    def attach_evidence(self, run_id: int, result_id: int, items: Iterable[EvidenceItem]) -> dict[str, Any]:
+        """Add evidence (with its step links) to a result that is already published."""
+        uploaded, warnings = self._upload_evidence(run_id, result_id, list(items), None)
+        return {
+            "run_id": run_id,
+            "result_id": result_id,
+            "attachments": uploaded,
+            "attachment_warnings": warnings,
+            "url": self.run_web_url(run_id),
         }
 
     def record_point_outcome(

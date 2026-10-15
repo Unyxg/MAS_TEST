@@ -77,6 +77,15 @@ PATCH _apis/test/Runs/{run}/results                      associatedBugs (bugs ra
 
 If a step fails before the run is completed, the run is set to **Aborted**, so no runs are left "In progress".
 
+## Evidence and steps
+
+- **Screenshots** are linked to the step you take them on (📷 on the step card, or F7 for the current step).
+- **Recordings** are linked to the step that is current when you press **Record**. Set `evidence.recording_links_to: "test"` in `config.yaml` to link them to the whole test instead.
+- **Change a link:** right-click an item in the Evidence list → **Link to** → a step or *Whole test*.
+- **Publishing** stores the step results first and then uploads each file to its step. The panel lists where each file went (`→ step 4` / `→ whole test`). If Azure DevOps refuses a step link, the file is attached to the whole result and you are told why. A file that cannot be uploaded at all does not undo the published result, and stays in the list.
+- **Add to a run that is already published** (for example a screenshot you took afterwards): link the item to its step, then click **＋ Add to published run…** and paste the run's address from Azure DevOps (it contains `runId=…&resultId=…`) or just the run number. The app shows which test case the run belongs to and what will be added, and skips files already uploaded to that run. Re-linking an item that was already uploaded adds another copy on the new step; the old copy stays where it was, because Azure DevOps cannot move an attachment.
+- Step links use the Test Results service (`vstmr.dev.azure.com`) with `iterationId` and `actionPath`; on Azure DevOps Server they use the normal server address.
+
 ## Reporting bugs
 
 In Azure DevOps a bug is a **work item** of type *Bug*. It is not part of the test case. It is **linked** to it:

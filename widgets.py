@@ -4,7 +4,7 @@ widgets.py - Reusable UI building blocks for the MAS-QA-Bridge dashboard.
     HostFrame      central frame that hosts the application under test
     TestExplorer   plan -> suite tree -> test points (left column)
     StepRunner     test case header + step cards with Pass/Fail/screenshot
-    EvidencePanel  record / screenshot controls and captured evidence list
+    EvidencePanel  record / screenshot controls and captured evidence list (relink to a step, add to a run)
     PublishPanel   outcome, comment, bugs raised and Publish button
     StatusPill     small coloured status badge
     RunAsDialog    account + password for "Run as different user"
@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -513,6 +514,8 @@ class EvidencePanel(QFrame):
     screenshot_requested = pyqtSignal()
     open_requested = pyqtSignal(object)  # Path
     open_folder_requested = pyqtSignal()
+    relink_requested = pyqtSignal(object, object)  # EvidenceItem, step index (or None = whole test)
+    attach_existing_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -527,8 +530,15 @@ class EvidencePanel(QFrame):
         self.folder_btn.setText("📁")
         self.folder_btn.setToolTip("Open the evidence folder")
         self.folder_btn.clicked.connect(self.open_folder_requested)
+        self.attach_existing_btn = QToolButton()
+        self.attach_existing_btn.setText("＋ Add to published run…")
+        self.attach_existing_btn.setToolTip(
+            "Add the checked evidence to a test run that is already published\n(paste the run's address from Azure DevOps)."
+        )
+        self.attach_existing_btn.clicked.connect(self.attach_existing_requested)
         head.addWidget(title)
         head.addStretch()
+        head.addWidget(self.attach_existing_btn)
         head.addWidget(self.folder_btn)
         layout.addLayout(head)
 
@@ -552,10 +562,44 @@ class EvidencePanel(QFrame):
         self.list.setMinimumHeight(72)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.list.setToolTip("Checked items are attached when you publish. Double-click to open.")
+        self.list.setToolTip(
+            "Checked items are attached when you publish. Double-click to open.\n"
+            "Right-click to link an item to a different step (or to the whole test)."
+        )
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context_menu)
+        self._steps: list[tuple[int, str]] = []
         self.list.itemDoubleClicked.connect(lambda item: self.open_requested.emit(item.data(Qt.ItemDataRole.UserRole).path))
         self.list.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.list, stretch=1)
+
+    def set_steps(self, steps: list[tuple[int, str]]) -> None:
+        """Steps of the loaded test case as (number, text), for the "Link to" menu."""
+        self._steps = steps
+
+    def _context_menu(self, pos: QPoint) -> None:
+        entry = self.list.itemAt(pos)
+        if entry is None:
+            return
+        item: EvidenceItem = entry.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        menu.addAction("Open", lambda: self.open_requested.emit(item.path))
+        link = menu.addMenu("Link to")
+        link.setEnabled(bool(self._steps))
+        whole = link.addAction("Whole test", lambda: self.relink_requested.emit(item, None))
+        whole.setCheckable(True)
+        whole.setChecked(item.step_number is None)
+        link.addSeparator()
+        for index, (number, text) in enumerate(self._steps):
+            label = f"Step {number}  ·  {text.strip().splitlines()[0][:48] if text.strip() else ''}"
+            action = link.addAction(label, lambda i=index: self.relink_requested.emit(item, i))
+            action.setCheckable(True)
+            action.setChecked(item.step_number == number)
+        if item.uploaded_to:
+            menu.addSeparator()
+            note = menu.addAction("Already uploaded - a new link adds another copy")
+            note.setEnabled(False)
+        menu.exec(self.list.viewport().mapToGlobal(pos))
 
     def set_recording(self, recording: bool, text: str = "") -> None:
         self.record_btn.setText(f"■ Stop  {text}" if recording else "● Record")

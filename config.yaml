@@ -59,3 +59,4 @@ evidence:
   jpeg_quality: 90                       # in-memory frame compression
   memory_budget_mb: 512                  # GIF is downscaled further to fit
   auto_stop_on_publish: true             # Publish stops + attaches an active recording
+  recording_links_to: "step"             # step = a recording is linked to the step current when it starts | test = whole test

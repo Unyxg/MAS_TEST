@@ -58,11 +58,13 @@ class EvidenceItem:
     step_action_path: Optional[str] = None
     attach: bool = True
     created_at: datetime = field(default_factory=utc_now)
+    uploaded_to: set[int] = field(default_factory=set)  # run ids this file was already uploaded to
 
     @property
     def label(self) -> str:
         where = f"Step {self.step_number}" if self.step_number else "Whole test"
-        return f"{where} · {self.created_at.astimezone():%H:%M:%S} · {self.path.name}"
+        done = "  ✔ uploaded" if self.uploaded_to else ""
+        return f"{where} · {self.created_at.astimezone():%H:%M:%S} · {self.path.name}{done}"
 
 
 @dataclass

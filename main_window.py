@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
-from PyQt6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QRunnable, QSettings, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QMoveEvent, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,17 +37,20 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from ado_test_api import AdoConfig, AdoTestClient
+from ado_test_api import AdoConfig, AdoTestClient, parse_run_link
 from bug_dialog import BugDialog
 from bug_report import BugReport
 from evidence_capture import EvidenceRecorder, Region
@@ -215,7 +218,7 @@ class MainWindow(QMainWindow):
         self.session: Optional[TestSession] = None
         self.session_published = False
         self.loose_evidence: list[EvidenceItem] = []  # captured before a test was selected
-        self._recording_step: Optional[int] = None
+        self._recording_ref: tuple[Optional[int], Optional[str]] = (None, None)
 
         self._build_ui()
         self._install_log_handler()
@@ -297,7 +300,20 @@ class MainWindow(QMainWindow):
         self.host_frame = HostFrame()
         self.host_frame.resized.connect(self._on_host_resized)
         centre_layout.addWidget(self.host_frame, stretch=1)
-        splitter.addWidget(centre)
+        # A slim handle on the explorer's edge hides / shows the Test Explorer (more room for the app).
+        self.explorer_toggle = QToolButton()
+        self.explorer_toggle.setObjectName("collapseHandle")
+        self.explorer_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.explorer_toggle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.explorer_toggle.setFixedWidth(16)
+        self.explorer_toggle.clicked.connect(self.toggle_explorer)
+        centre_outer = QWidget()
+        centre_row = QHBoxLayout(centre_outer)
+        centre_row.setContentsMargins(0, 0, 0, 0)
+        centre_row.setSpacing(4)
+        centre_row.addWidget(self.explorer_toggle)
+        centre_row.addWidget(centre, stretch=1)
+        splitter.addWidget(centre_outer)
 
         # right: runner, evidence, result
         right = QWidget()
@@ -314,6 +330,8 @@ class MainWindow(QMainWindow):
         self.evidence_panel.screenshot_requested.connect(lambda: self.take_screenshot(self.runner.current))
         self.evidence_panel.open_requested.connect(lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))))
         self.evidence_panel.open_folder_requested.connect(self.open_evidence_folder)
+        self.evidence_panel.relink_requested.connect(self.relink_evidence)
+        self.evidence_panel.attach_existing_requested.connect(self.attach_to_published_run)
         default_format = str(self.ev_cfg.get("format", "GIF")).upper()
         self.evidence_panel.format_combo.setCurrentText(default_format if default_format in ("GIF", "MP4") else "GIF")
         self.evidence_panel.setMaximumHeight(180)
@@ -330,6 +348,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([290, 960, 420])
+        self._splitter = splitter
+        self._set_explorer_visible(not bool(QSettings(APP_NAME, APP_NAME).value("ui/explorer_collapsed", False, type=bool)))
 
         body = QWidget()
         body_layout = QVBoxLayout(body)
@@ -447,6 +467,7 @@ class MainWindow(QMainWindow):
             "Ctrl+Enter": self.publish,
             "Ctrl+L": lambda: self.log_btn.toggle(),
             "Ctrl+B": lambda: self.open_bug_dialog(),
+            "Ctrl+E": lambda: self.toggle_explorer(),
         }
         for keys, slot in bindings.items():
             shortcut = QShortcut(QKeySequence(keys), self)
@@ -810,8 +831,23 @@ class MainWindow(QMainWindow):
         self.runner.refresh()
         items = self.session.evidence if self.session else self.loose_evidence
         self.evidence_panel.set_items(items)
+        self.evidence_panel.set_steps([(st.number, st.action) for st in self.session.steps] if self.session else [])
         self.publish_panel.show_suggestion(self.session.suggested_outcome() if self.session else None)
         self._update_controls()
+
+    # ===================================================== explorer
+    def _set_explorer_visible(self, visible: bool) -> None:
+        self.explorer.setVisible(visible)
+        self.explorer_toggle.setText("‹" if visible else "›")
+        self.explorer_toggle.setToolTip(
+            "Hide the Test Explorer (Ctrl+E)" if visible else "Show the Test Explorer (Ctrl+E)"
+        )
+        QTimer.singleShot(0, self._on_host_resized)
+
+    def toggle_explorer(self) -> None:
+        visible = not self.explorer.isVisible()
+        self._set_explorer_visible(visible)
+        QSettings(APP_NAME, APP_NAME).setValue("ui/explorer_collapsed", not visible)
 
     # ===================================================== evidence
     def _evidence_name(self, suffix: str) -> str:
@@ -840,6 +876,82 @@ class MainWindow(QMainWindow):
             return
         self._add_evidence(EvidenceItem(path, "screenshot", number, path_ref))
 
+    def relink_evidence(self, item: EvidenceItem, step_index: Optional[int]) -> None:
+        """Link a screenshot / recording to another step (or the whole test)."""
+        item.step_number, item.step_action_path = self._step_ref(step_index)
+        item.uploaded_to.clear()  # a new link means a new upload; copies already in Azure DevOps stay where they are
+        self._refresh_session_views()
+        log.info("%s is now linked to %s", item.path.name, f"step {item.step_number}" if item.step_number else "the whole test")
+
+    def attach_to_published_run(self) -> None:
+        """Add the checked evidence (with its step links) to a run that is already published."""
+        if self.ado_client is None:
+            return
+        items = [e for e in (self.session.evidence if self.session else self.loose_evidence) if e.attach and e.path.exists()]
+        if not items:
+            QMessageBox.information(self, APP_NAME, "There is no checked evidence to add.")
+            return
+        default = ""
+        if self.session and self.session.run_id:
+            default = f"{self.ado_client.run_web_url(self.session.run_id)}&resultId={self.session.result_id}"
+        text, ok = QInputDialog.getText(
+            self,
+            "Add evidence to a published run",
+            "Paste the run's address from Azure DevOps (it contains runId=…&resultId=…) or the run number:",
+            text=default,
+        )
+        if not ok or not text.strip():
+            return
+        try:
+            run_id, result_id = parse_run_link(text)
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+
+        def confirm(info: dict[str, Any]) -> None:
+            pending = [e for e in items if info["run_id"] not in e.uploaded_to]
+            if not pending:
+                QMessageBox.information(self, APP_NAME, "Everything checked has already been uploaded to that run.")
+                return
+            wanted = self.session.point.test_case_id if self.session else None
+            warning = ""
+            if wanted and info["test_case_id"] and info["test_case_id"] != wanted:
+                warning = (
+                    f"\n\n⚠ That run is for test case #{info['test_case_id']}, but you are testing #{wanted}. "
+                    "Continue only if this is the right run."
+                )
+            lines = "\n".join(
+                f"  • {e.path.name} → " + (f"step {e.step_number}" if e.step_number else "whole test") for e in pending
+            )
+            answer = QMessageBox.question(
+                self,
+                "Add evidence to a published run",
+                f"Run #{info['run_id']} · result {info['result_id']}\n"
+                f"Test case #{info['test_case_id']} {info['test_case_title']} ({info['outcome']})\n\n"
+                f"Add {len(pending)} file(s)?\n{lines}{warning}",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.evidence_panel.attach_existing_btn.setEnabled(False)
+            self._run_task(
+                self.ado_client.attach_evidence,
+                info["run_id"],
+                info["result_id"],
+                pending,
+                on_success=self._on_evidence_attached,
+                on_finished=lambda: (self.evidence_panel.attach_existing_btn.setEnabled(True), self._refresh_session_views()),
+            )
+
+        self.statusBar().showMessage(f"Looking up run {run_id}…")
+        self._run_task(self.ado_client.inspect_result, run_id, result_id, on_success=confirm)
+
+    def _on_evidence_attached(self, report: dict[str, Any]) -> None:
+        lines = [f"✔ {len(report['attachments'])} file(s) added to <a style='color:#79b0ff' href='{report['url']}'>run #{report['run_id']}</a>"]
+        lines += [f"&nbsp;&nbsp;{a}" for a in report["attachments"]]
+        lines += [f"<span style='color:#e3b341'>⚠ {w}</span>" for w in report["attachment_warnings"]]
+        self.publish_panel.status.setText("<br>".join(lines))
+        log.info("Added %d file(s) to run %s", len(report["attachments"]), report["run_id"])
+
     def toggle_recording(self) -> None:
         if self.recorder.is_recording:
             self.stop_recording()
@@ -850,7 +962,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error(str(exc))
             return
-        self._recording_step = None  # recordings cover the whole test
+        # A recording is linked to the step that is current when it starts (right-click it to change).
+        linked = str(self.ev_cfg.get("recording_links_to", "step")).lower() == "step"
+        self._recording_ref = self._step_ref(self.runner.current) if linked else (None, None)
         self.evidence_panel.set_recording(True, "00:00")
 
     def _save_recording(self) -> EvidenceItem:
@@ -859,7 +973,8 @@ class MainWindow(QMainWindow):
             path = self.recorder.stop_and_save_mp4(name)
         else:
             path = self.recorder.stop_and_save_gif(name)
-        return EvidenceItem(path, "recording")
+        number, action_path = self._recording_ref
+        return EvidenceItem(path, "recording", number, action_path)
 
     def stop_recording(self) -> None:
         self.evidence_panel.record_btn.setEnabled(False)
@@ -930,8 +1045,10 @@ class MainWindow(QMainWindow):
         if self.session:
             self.explorer.set_point_outcome(self.session.point.id, report["outcome"])
         lines = [f"✔ <b>{report['outcome']}</b> published → <a style='color:#79b0ff' href='{report['url']}'>run #{report['run_id']}</a>"]
-        if report["attachments"]:
-            lines.append(f"{len(report['attachments'])} attachment(s) uploaded")
+        for entry in report["attachments"]:
+            lines.append(f"&nbsp;&nbsp;📎 {entry}")
+        for warning in report.get("attachment_warnings", []):
+            lines.append(f"<span style='color:#e3b341'>⚠ {warning}</span>")
         for bug in report.get("bugs", []):
             lines.append(f"🐞 <a style='color:#79b0ff' href='{bug['url']}'>Bug #{bug['id']}</a> linked to this result")
         self.publish_panel.status.setText("<br>".join(lines))

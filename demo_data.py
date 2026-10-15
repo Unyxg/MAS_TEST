@@ -179,6 +179,7 @@ class DemoAdoClient(AdoTestClient):
         )
         self.latency = latency
         self.calls: list[tuple[str, str, Any]] = []
+        self.requests: list[dict[str, Any]] = []  # same calls with their query parameters and service scope
         self._runs: dict[int, int] = {}  # run id -> point id
         self._next_run = 5100
 
@@ -186,6 +187,7 @@ class DemoAdoClient(AdoTestClient):
         time.sleep(self.latency)
         body = kwargs.get("json_body")
         self.calls.append((method, path, body))
+        self.requests.append({"method": method, "path": path, "params": kwargs.get("params") or {}, "scope": kwargs.get("scope", "project")})
         parts = path.strip("/").split("/")
 
         if path == "projects":
@@ -220,6 +222,11 @@ class DemoAdoClient(AdoTestClient):
             self._next_run += 1
             self._runs[self._next_run] = body["pointIds"][0]
             return _FakeResponse({"id": self._next_run, "state": "InProgress"})
+        if parts[:2] == ["test", "Runs"] and len(parts) == 5 and parts[3] == "results" and method == "GET":
+            case_id = (self._runs.get(int(parts[2])) or 74101) - 70000
+            return _FakeResponse({"id": int(parts[4]), "outcome": "Failed", "testCaseTitle": TEST_CASES[case_id][0],
+                                  "testCase": {"id": str(case_id), "name": TEST_CASES[case_id][0]},
+                                  "testRun": {"name": "MAS-QA-Bridge - demo"}})
         if parts[0] == "test" and parts[-1] == "results" and method == "GET":
             run_id = int(parts[2])
             return _FakeResponse({"value": [{"id": 100000, "testPoint": {"id": str(self._runs.get(run_id))}}]})

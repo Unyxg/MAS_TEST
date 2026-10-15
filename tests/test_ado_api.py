@@ -62,7 +62,7 @@ def test_record_execution_sends_step_results(client, tmp_path):
 
     report = client.record_execution(session, "Failed", "see step 6")
 
-    assert report["attachments"] == ["s.png"] and session.run_id == report["run_id"]
+    assert report["attachments"] == ["s.png → step 6"] and session.run_id == report["run_id"]
     update = next(body for m, p, body in client.calls if m == "PATCH" and p.endswith("/results") and "iterationDetails" in body[0])
     actions = update[0]["iterationDetails"][0]["actionResults"]
     assert len(actions) == 8
@@ -217,3 +217,103 @@ def test_field_lookup_by_display_name(client):
 def test_diagnostics_list_required_fields_with_reference_names(client):
     row = next(detail for name, ok, detail in client.run_diagnostics() if name.startswith("Extra required"))
     assert "Custom.CreatedByTeam" in row and "Custom.DetectedInPhase" in row and "default: Platform" in row
+
+
+# ---------------------------------------------------------------- evidence linked to steps
+def _paths(client):
+    return [(r["method"], r["scope"], r["path"], r["params"]) for r in client.requests]
+
+
+def test_step_screenshot_goes_to_the_test_results_service_with_step_and_iteration(client, tmp_path):
+    session = _executed_session(client, tmp_path)
+    client.record_execution(session, "Failed")
+    step_calls = [r for r in client.requests if r["scope"] == "testresults"]
+    assert len(step_calls) == 1
+    assert step_calls[0]["path"] == "testresults/runs/5101/results/100000/attachments"
+    assert step_calls[0]["params"] == {"iterationId": 1, "actionPath": "00000006"}
+    # nothing step-linked went to the old endpoint, which would attach it to the whole result
+    assert not [r for r in client.requests if r["path"].endswith("attachments") and r["scope"] == "project" and "actionPath" in r["params"]]
+
+
+def test_whole_test_evidence_uses_the_result_endpoint(client, tmp_path):
+    session = _executed_session(client, tmp_path)
+    session.evidence[0].step_number, session.evidence[0].step_action_path = None, None
+    report = client.record_execution(session, "Failed")
+    assert report["attachments"] == ["s.png → whole test"]
+    assert [r for r in client.requests if r["path"] == "test/Runs/5101/Results/100000/attachments"]
+
+
+def test_step_results_are_stored_before_evidence_is_linked(client, tmp_path):
+    client.record_execution(_executed_session(client, tmp_path), "Failed")
+    order = [r["path"] for r in client.requests if r["method"] in ("PATCH", "POST") and "attachments" in r["path"] or r["path"].endswith("/results") and r["method"] == "PATCH"]
+    assert order.index("test/Runs/5101/results") < order.index("testresults/runs/5101/results/100000/attachments")
+
+
+def test_refused_step_link_falls_back_to_the_result_and_says_so(client, tmp_path):
+    session = _executed_session(client, tmp_path)
+    original = client._send
+
+    def send(method, path, **kw):
+        if kw.get("scope") == "testresults":
+            raise AdoError("HTTP 400: iteration does not exist", 400)
+        return original(method, path, **kw)
+
+    client._send = send
+    report = client.record_execution(session, "Failed")
+    assert report["attachments"] == ["s.png → whole test"]
+    assert "refused the link to step 6" in report["attachment_warnings"][0]
+
+
+def test_one_failed_upload_does_not_undo_the_published_result(client, tmp_path):
+    session = _executed_session(client, tmp_path)
+    original = client._send
+
+    def send(method, path, **kw):
+        if "attachments" in path:
+            raise AdoError("HTTP 500: boom", 500)
+        return original(method, path, **kw)
+
+    client._send = send
+    report = client.record_execution(session, "Failed")
+    assert report["attachments"] == [] and "not uploaded" in report["attachment_warnings"][0]
+    assert report["run_id"] == 5101 and not session.evidence[0].uploaded_to  # stays available to attach again
+
+
+def test_attach_to_an_already_published_run_skips_what_is_already_there(client, tmp_path):
+    session = _executed_session(client, tmp_path)
+    client.record_execution(session, "Failed")
+    item = session.evidence[0]
+    assert item.uploaded_to == {5101}
+    again = client.attach_evidence(5101, 100000, [item])
+    assert again["attachments"] == [] and again["attachment_warnings"] == []
+
+    item.step_number, item.step_action_path = 4, session.steps[3].action_path   # re-linked to step 4
+    item.uploaded_to.clear()
+    moved = client.attach_evidence(5101, 100000, [item])
+    assert moved["attachments"] == ["s.png → step 4"]
+    assert client.requests[-1]["params"] == {"iterationId": 1, "actionPath": "00000004"}
+
+
+def test_inspect_result_describes_the_run(client):
+    run = client.create_test_run(74101, plan_id=101)
+    info = client.inspect_result(run["id"], 100000)
+    assert info["test_case_id"] == 4101 and info["result_id"] == 100000
+
+
+def test_testresults_address(client):
+    assert client.testresults_url == "https://vstmr.dev.azure.com/contoso/Orders%20Portal"
+    legacy = AdoTestClient(AdoConfig.from_dict({"organization": "adient", "project": "IT-MFG-MIRA", "pat": "x" * 52,
+                                                "base_url": "https://adient.visualstudio.com"}))
+    assert legacy.testresults_url == "https://vstmr.dev.azure.com/adient/IT-MFG-MIRA"
+    onprem = AdoTestClient(AdoConfig.from_dict({"organization": "DefaultCollection", "project": "P", "pat": "x" * 52,
+                                                "base_url": "https://tfs.company.local/tfs"}))
+    assert onprem.testresults_url == onprem.project_url
+
+
+def test_run_link_parsing():
+    from ado_test_api import parse_run_link
+    url = "https://adient.visualstudio.com/IT-MFG-MIRA/_testManagement/runs?_a=attachments&runId=1151243&resultId=100000"
+    assert parse_run_link(url) == (1151243, 100000)
+    assert parse_run_link("1151243") == (1151243, None) and parse_run_link("1151243/100001") == (1151243, 100001)
+    with pytest.raises(ValueError):
+        parse_run_link("not a link")

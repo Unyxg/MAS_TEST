@@ -127,6 +127,12 @@ QTextBrowser {{ background: #fbfbfc; color: #1f2328; border: none; border-radius
 QPushButton#bugLink {{ background: transparent; border: 1px solid {fail}; color: #ff7b72; padding: 3px 8px; }}
 QPushButton#bugLink:hover {{ background: #42191a; }}
 
+QToolButton#collapseHandle {{
+    background: {panel}; border: 1px solid {border}; border-radius: 6px; color: {muted};
+    padding: 0; font-size: 20px; font-weight: 700;
+}}
+QToolButton#collapseHandle:hover {{ background: {panel_alt}; border-color: {accent}; color: {text}; }}
+
 QSplitter::handle {{ background: {bg}; }}
 QScrollArea {{ background: transparent; border: none; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
