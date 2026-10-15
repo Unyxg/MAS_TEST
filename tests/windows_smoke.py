@@ -92,8 +92,12 @@ def main() -> int:
     check("read .exe version", numeric, f"product={product} file={numeric}")
     check("dashboard account", True, f"{run_as.current_account()} elevated={run_as.is_admin()}")
 
-    @section("current user: reparent + capture + dock")
+    def select_mode(name: str) -> None:
+        window.mode_combo.setCurrentIndex(window.mode_combo.findData(name))
+
+    @section("current user: reparent + capture + dock + align")
     def current_user() -> None:
+        select_mode("reparent")
         pid = wm.launch(TARGET)
         hwnd = wm.find_window(timeout=30)
         check("find window", hwnd, f"'{win32gui.GetWindowText(hwnd)}' pid={pid}")
@@ -124,7 +128,7 @@ def main() -> int:
         gif = window.recorder.stop_and_save_gif("embedded_recording")
         check("GIF recording of host area", gif.stat().st_size > 1000, f"{window.recorder.frame_count} frames")
 
-        window.mode_combo.setCurrentIndex(1)  # Dock (overlay) -> re-embeds
+        select_mode("dock")  # re-embeds
         pump(app, 1.0)
         owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
         check("dock: owned by dashboard", owner == int(window.winId()), f"owner=0x{owner:X}")
@@ -139,11 +143,27 @@ def main() -> int:
         check("dock: follows dashboard move", (wl, wt) == (x, y), f"{(wl, wt)} vs {(x, y)}")
         desktop_png("2_dock")
 
+        select_mode("align")  # re-embeds: must leave the window's styles, owner and parent alone
+        pump(app, 1.0)
+        check("align: frame, owner and parent untouched",
+              bool(win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE) & win32con.WS_CAPTION)
+              and win32gui.GetParent(hwnd) == 0 and win32gui.GetWindow(hwnd, win32con.GW_OWNER) == 0)
+        x, y = win32gui.ClientToScreen(host, (0, 0))
+        wl, wt, wr, wb = win32gui.GetWindowRect(hwnd)
+        hl, ht, hr, hb = win32gui.GetClientRect(host)
+        check("align: positioned and sized over host", (wl, wt, wr - wl, wb - wt) == (x, y, hr - hl, hb - ht),
+              f"{(wl, wt, wr - wl, wb - wt)} vs {(x, y, hr - hl, hb - ht)}")
+        window.move(window.x() - 60, window.y() - 40)
+        pump(app, 0.8)
+        x, y = win32gui.ClientToScreen(host, (0, 0))
+        wl, wt, _, _ = win32gui.GetWindowRect(hwnd)
+        check("align: follows dashboard move", (wl, wt) == (x, y), f"{(wl, wt)} vs {(x, y)}")
+        desktop_png("3_align")
+
         wm.release()
         pump(app, 0.5)
         check("release: back on desktop", win32gui.GetParent(hwnd) == 0 and win32gui.GetWindow(hwnd, win32con.GW_OWNER) == 0)
         check("release: caption restored", win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE) & win32con.WS_CAPTION)
-        window.mode_combo.setCurrentIndex(0)
         wm.terminate()
         pump(app, 1.0)
         check("terminate", not psutil.pid_exists(pid))
@@ -175,6 +195,7 @@ def main() -> int:
         hwnd = wm.find_window(timeout=45)
         account = run_as.process_account(pid) or ""
         check("process runs as that account", account.lower().endswith(user.lower()), account)
+        select_mode("reparent")
         window._embed_window(hwnd)
         pump(app, 1.0)
         check("other user's window embedded", win32gui.GetParent(hwnd) == host)
@@ -249,11 +270,11 @@ def main() -> int:
         window.explorer.refresh_requested.connect(lambda: clicks.append(1))
         button = window.explorer.refresh_btn
 
-        cases = [("reparent", 0, False), ("reparent", 0, True), ("dock", 1, True)]
-        for mode_name, mode_index, guard in cases:
+        cases = [("reparent", "reparent", False), ("reparent", "reparent", True), ("dock", "dock", True), ("align", "align", True)]
+        for mode_name, mode_key, guard in cases:
             label = f"{mode_name}, guard {'on' if guard else 'OFF (experiment)'}"
             (window._guard_timer.start if guard else window._guard_timer.stop)()
-            window.mode_combo.setCurrentIndex(mode_index)
+            select_mode(mode_key)
             pid = wm.launch(pythonw, args=[target, "--popup-after", "3500"])
             hwnd = wm.find_window(timeout=30, title_contains="Modal Target")
             window._embed_window(hwnd)
