@@ -206,6 +206,35 @@ def launch_current(
     return LaunchedProcess(proc.pid, proc, label)
 
 
+def launch_detached(
+    exe_path: str, args: Sequence[str], cwd: Optional[str], env: Optional[dict[str, str]] = None
+) -> LaunchedProcess:
+    """Start through ``cmd /c start`` so the application is not a direct child of the dashboard
+    (its parent becomes a short-lived cmd.exe, much like starting it from a shortcut)."""
+    import time
+
+    import psutil
+    import win32api
+    import win32con
+
+    started = time.time() - 1
+    image = os.path.basename(exe_path).lower()
+    subprocess.Popen(
+        ["cmd.exe", "/c", "start", "", "/D", cwd or os.path.dirname(exe_path), exe_path, *args],
+        cwd=cwd, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        for proc in psutil.process_iter(["pid", "name", "create_time"]):
+            info = proc.info
+            if (info.get("name") or "").lower() == image and (info.get("create_time") or 0) >= started:
+                handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, False, info["pid"])
+                label = current_account() + (" (elevated)" if is_admin() else "")
+                return LaunchedProcess(info["pid"], handle, label)
+        time.sleep(0.2)
+    raise RuntimeError(f"{image} did not start within 20 seconds when started through 'cmd /c start'.")
+
+
 def launch_elevated(
     exe_path: str, args: Sequence[str], cwd: Optional[str], env: Optional[dict[str, str]] = None
 ) -> LaunchedProcess:
@@ -314,6 +343,7 @@ def launch(
     run_as: str = RUN_AS_CURRENT,
     credentials: Optional[Credentials] = None,
     environment: Optional[dict] = None,
+    method: str = "direct",
 ) -> LaunchedProcess:
     """Start the application. ``environment`` is the ``app.environment`` section of config.yaml:
     ``clean`` (default true), ``remove`` (extra names) and ``set`` (extra variables).
@@ -336,6 +366,8 @@ def launch(
         if credentials is None:
             raise ValueError("Credentials are required to run as a different user.")
         return launch_as_user(exe_path, args, cwd, credentials)
+    if method == "detached":
+        return launch_detached(exe_path, args, cwd, env)
     return launch_current(exe_path, args, cwd, env)
 
 

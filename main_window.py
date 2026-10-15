@@ -635,6 +635,7 @@ class MainWindow(QMainWindow):
                 run_as_mode=mode,
                 credentials=credentials,
                 environment=self.app_cfg.get("environment") or {},
+                method=str(self.app_cfg.get("launch_method") or "direct"),
             )
         except PermissionError as exc:
             self._show_error(str(exc))

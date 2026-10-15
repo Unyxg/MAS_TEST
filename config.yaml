@@ -52,6 +52,7 @@ app:
     clean: true                          # drop variables the dashboard's own runtime sets (QT_PLUGIN_PATH, _PYI_*, ...) and ADO_PAT
     remove: []                           # extra variable names to drop ("NAME" or "PREFIX*")
     set: {}                              # extra variables to give it, e.g. {"MAS_MODE": "test"}
+  launch_method: "direct"                # direct | detached (via "cmd /c start": the app is not a direct child of the dashboard)
   on_exit: "release"                     # release | terminate
 
 evidence:

@@ -162,6 +162,7 @@ class WindowManager:
         run_as_mode: str = run_as.RUN_AS_CURRENT,
         credentials: Optional[run_as.Credentials] = None,
         environment: Optional[dict] = None,
+        method: str = "direct",
     ) -> int:
         """Start ``exe_path`` (as the current user, elevated, or another user); return its PID."""
         _require_windows()
@@ -179,6 +180,7 @@ class WindowManager:
             run_as_mode,
             credentials,
             environment,
+            method,
         )
         self.pid = self.process.pid
         self.run_as_label = self.process.run_as_label
