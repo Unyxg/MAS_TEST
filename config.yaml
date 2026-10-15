@@ -48,6 +48,10 @@ app:
   embed_mode: "reparent"                 # reparent (SetParent) | dock (overlay)
   run_as: "current"                      # current | admin | user (default of the "Run as" selector)
   run_as_account: ""                     # e.g. "CONTOSO\\qa.tester2" pre-filled for "different user"
+  environment:                           # what the application inherits from the dashboard
+    clean: true                          # drop variables the dashboard's own runtime sets (QT_PLUGIN_PATH, _PYI_*, ...) and ADO_PAT
+    remove: []                           # extra variable names to drop ("NAME" or "PREFIX*")
+    set: {}                              # extra variables to give it, e.g. {"MAS_MODE": "test"}
   on_exit: "release"                     # release | terminate
 
 evidence:

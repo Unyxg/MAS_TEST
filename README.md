@@ -195,6 +195,10 @@ To launch it differently from how MAS-QA-Bridge is running, use the header selec
 
 The account the app ran as is added to every bug's **Environment** section ("Application ran as").
 
+## What the application inherits from the dashboard
+
+A program started by the dashboard inherits its account, elevation and **environment variables**. The dashboard's own runtime adds some variables for itself (`QT_PLUGIN_PATH`, `QML2_IMPORT_PATH`, `_PYI_*`, `DLIB_*`). An application that uses a different version of Qt, or reads such variables, can misbehave when it inherits them: in one real case a page of the application stayed empty only when it was started from here, and those variables were the only difference from a copy started from Explorer. The dashboard therefore removes them (and `ADO_PAT`, plus anything pointing into the dashboard's own folder) before starting the application. Adjust this under `app.environment` in `config.yaml`: `clean: false` restores the old behaviour, `remove` drops more names, `set` adds variables. The `Log → Compare how the application was started` report lists the variable *names* of every copy, so you can check what was passed.
+
 ## Embedding modes (header drop-down)
 
 | Mode | How | Best for |

@@ -21,6 +21,7 @@ so elevated apps can be embedded.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import os
@@ -121,36 +122,111 @@ def process_account(pid: int) -> Optional[str]:
 
 
 # ----------------------------------------------------------------------------
+# Environment hygiene
+# ----------------------------------------------------------------------------
+# A program started by the dashboard inherits the dashboard's environment, which also holds variables the
+# dashboard's own runtime (PyInstaller, Qt, imaging libraries) set for itself. A real case: an application
+# that works when started from Explorer misbehaved when started from here, and the only difference was
+# six such variables (QT_PLUGIN_PATH, QML2_IMPORT_PATH, _PYI_*, DLIB_*). They are removed so the
+# application starts with the environment it would get from Explorer.
+_DROP_NAMES = {"QT_PLUGIN_PATH", "QML2_IMPORT_PATH", "QML_IMPORT_PATH", "PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE",
+               "ADO_PAT"}  # ADO_PAT: the application under test has no business seeing the access token
+_DROP_PREFIXES = ("_PYI", "_MEI", "DLIB_", "QT_QPA_", "QT_QUICK_")
+
+
+def _own_dirs() -> list[str]:
+    """Folders of the running dashboard (the unpacked bundle), lower-cased, for 'points into me' checks."""
+    dirs = []
+    for d in (getattr(sys, "_MEIPASS", None), os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None):
+        if d:
+            dirs.append(os.path.normcase(os.path.abspath(d)))
+    return dirs
+
+
+def clean_environment(
+    env: Optional[dict[str, str]] = None,
+    remove: Sequence[str] = (),
+    set_vars: Optional[dict[str, str]] = None,
+    own_dirs: Optional[Sequence[str]] = None,
+) -> tuple[dict[str, str], list[str]]:
+    """The environment to give the application under test, and the names that were removed.
+
+    Removes the dashboard-runtime variables listed above, any variable whose value points into the
+    dashboard's own folder, and PATH entries inside that folder; then applies ``remove`` (extra names,
+    ``*`` wildcard at the end allowed) and ``set_vars`` from config.yaml.
+    """
+    env = dict(os.environ if env is None else env)
+    own = [os.path.normcase(d) for d in (_own_dirs() if own_dirs is None else own_dirs)]
+    extra = [r.upper() for r in remove]
+    removed: list[str] = []
+    for name in list(env):
+        upper = name.upper()
+        value = os.path.normcase(env[name])
+        if upper == "PATH":
+            kept = [p for p in env[name].split(os.pathsep) if not any(d and os.path.normcase(p).startswith(d) for d in own)]
+            if len(kept) != len(env[name].split(os.pathsep)):
+                env[name] = os.pathsep.join(kept)
+                removed.append(f"{name} (entries inside the dashboard folder)")
+            continue
+        listed = upper in _DROP_NAMES or upper.startswith(_DROP_PREFIXES)
+        configured = any(upper == r or (r.endswith("*") and upper.startswith(r[:-1])) for r in extra)
+        points_inside = any(d and d in value for d in own)
+        if listed or configured or points_inside:
+            del env[name]
+            removed.append(name)
+    env.update({str(k): str(v) for k, v in (set_vars or {}).items()})
+    return env, removed
+
+
+@contextlib.contextmanager
+def _temporary_environment(env: dict[str, str]):
+    """Run a block with os.environ replaced (for APIs that can only inherit, like ShellExecuteEx)."""
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+# ----------------------------------------------------------------------------
 # Launching
 # ----------------------------------------------------------------------------
 def _command_line(exe_path: str, args: Sequence[str]) -> str:
     return subprocess.list2cmdline([exe_path, *args])
 
 
-def launch_current(exe_path: str, args: Sequence[str], cwd: Optional[str]) -> LaunchedProcess:
-    proc = subprocess.Popen([exe_path, *args], cwd=cwd)
+def launch_current(
+    exe_path: str, args: Sequence[str], cwd: Optional[str], env: Optional[dict[str, str]] = None
+) -> LaunchedProcess:
+    proc = subprocess.Popen([exe_path, *args], cwd=cwd, env=env)
     label = current_account() + (" (elevated)" if is_admin() else "")
     return LaunchedProcess(proc.pid, proc, label)
 
 
-def launch_elevated(exe_path: str, args: Sequence[str], cwd: Optional[str]) -> LaunchedProcess:
+def launch_elevated(
+    exe_path: str, args: Sequence[str], cwd: Optional[str], env: Optional[dict[str, str]] = None
+) -> LaunchedProcess:
     """Start elevated through UAC (``runas`` verb). Raises if the user declines."""
     if is_admin():
         # Already elevated: children inherit the elevated token, no prompt needed.
-        return launch_current(exe_path, args, cwd)
+        return launch_current(exe_path, args, cwd, env)
     import win32con
     import win32process
     from win32com.shell import shell, shellcon
 
     try:
-        info = shell.ShellExecuteEx(
-            fMask=shellcon.SEE_MASK_NOCLOSEPROCESS | 0x00000100,  # SEE_MASK_NOASYNC
-            lpVerb="runas",
-            lpFile=exe_path,
-            lpParameters=subprocess.list2cmdline(list(args)),
-            lpDirectory=cwd or "",
-            nShow=win32con.SW_SHOWNORMAL,
-        )
+        with _temporary_environment(env) if env is not None else contextlib.nullcontext():
+            info = shell.ShellExecuteEx(
+                fMask=shellcon.SEE_MASK_NOCLOSEPROCESS | 0x00000100,  # SEE_MASK_NOASYNC
+                lpVerb="runas",
+                lpFile=exe_path,
+                lpParameters=subprocess.list2cmdline(list(args)),
+                lpDirectory=cwd or "",
+                nShow=win32con.SW_SHOWNORMAL,
+            )
     except Exception as exc:  # ERROR_CANCELLED (1223) when UAC is declined
         if getattr(exc, "winerror", None) == 1223 or "1223" in str(exc):
             raise PermissionError("Elevation was cancelled at the UAC prompt.") from exc
@@ -237,14 +313,30 @@ def launch(
     cwd: Optional[str] = None,
     run_as: str = RUN_AS_CURRENT,
     credentials: Optional[Credentials] = None,
+    environment: Optional[dict] = None,
 ) -> LaunchedProcess:
+    """Start the application. ``environment`` is the ``app.environment`` section of config.yaml:
+    ``clean`` (default true), ``remove`` (extra names) and ``set`` (extra variables).
+
+    A different user gets that user's own profile environment from Windows (nothing is inherited)."""
+    policy = environment or {}
+    env: Optional[dict[str, str]] = None
+    if policy.get("clean", True) or policy.get("remove") or policy.get("set"):
+        env, removed = clean_environment(
+            remove=policy.get("remove") or [], set_vars=policy.get("set") or {}
+        ) if policy.get("clean", True) else (
+            {**os.environ, **{str(k): str(v) for k, v in (policy.get("set") or {}).items()}}, []
+        )
+        if removed:
+            log.info("Starting %s without %d variable(s) inherited from the dashboard: %s",
+                     os.path.basename(exe_path), len(removed), ", ".join(removed))
     if run_as == RUN_AS_ADMIN:
-        return launch_elevated(exe_path, args, cwd)
+        return launch_elevated(exe_path, args, cwd, env)
     if run_as == RUN_AS_USER:
         if credentials is None:
             raise ValueError("Credentials are required to run as a different user.")
         return launch_as_user(exe_path, args, cwd, credentials)
-    return launch_current(exe_path, args, cwd)
+    return launch_current(exe_path, args, cwd, env)
 
 
 def handle_exit_code(handle: object) -> Optional[int]:

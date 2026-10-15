@@ -192,6 +192,25 @@ def main() -> int:
         except PermissionError as exc:
             check("wrong password rejected", "incorrect" in str(exc), str(exc))
 
+    @section("application started from the dashboard gets a clean environment")
+    def clean_environment_check() -> None:
+        polluted = {"QT_PLUGIN_PATH": r"C:\fake\Qt6\plugins", "QML2_IMPORT_PATH": r"C:\fake\qml", "_PYI_ARCHIVE_FILE": "x",
+                    "DLIB_SILENCE": "1", "ADO_PAT": "smoke-test-secret", "KEEP_ME": "yes"}
+        saved = {k: os.environ.get(k) for k in polluted}
+        os.environ.update(polluted)
+        try:
+            pid = wm.launch(TARGET)
+            env = psutil.Process(pid).environ()
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        wm.terminate()
+        pump(app, 0.5)
+        check("dashboard runtime variables are not inherited",
+              not any(k in env for k in ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH", "_PYI_ARCHIVE_FILE", "DLIB_SILENCE", "ADO_PAT")),
+              f"{len(env)} variables")
+        check("other variables are still inherited", env.get("KEEP_ME") == "yes" and "SYSTEMROOT" in env)
+
     @section("modal popups opened by the embedded application")
     def modal_popups() -> None:
         import ctypes
@@ -271,6 +290,7 @@ def main() -> int:
         window.mode_combo.setCurrentIndex(0)
 
     current_user()
+    clean_environment_check()
     modal_popups()
     administrator()
     other_user()
