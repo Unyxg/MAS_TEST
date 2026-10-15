@@ -24,6 +24,7 @@ import mss  # noqa: E402
 import psutil  # noqa: E402
 import win32con  # noqa: E402
 import win32gui  # noqa: E402
+import win32process  # noqa: E402
 from mss import tools as mss_tools  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
