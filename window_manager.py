@@ -386,6 +386,36 @@ class WindowManager:
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
         log.info("Embedded window 0x%08X into host 0x%08X (%s mode)", hwnd, host_hwnd, mode)
 
+    def experiment(self, kind: str, host_hwnd: int, hwnd: Optional[int] = None) -> str:
+        """Diagnostic: apply ONE of the embedding steps to the window (nothing is saved or restored).
+
+        ``resize``: move/size the window over the host area, no style change.
+        ``frame``: strip the caption/borders only, keep position and size.
+        ``child``: make it a child of the host (style + SetParent), keep its own size.
+        """
+        _require_windows()
+        hwnd = hwnd or self.hwnd
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            raise EmbedError("Target window handle is not valid.")
+        self.hwnd = hwnd
+        flags = win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        before = win32gui.GetWindowRect(hwnd)
+        if kind == "resize":
+            left, top, right, bottom = win32gui.GetClientRect(host_hwnd)
+            x, y = win32gui.ClientToScreen(host_hwnd, (0, 0))
+            win32gui.SetWindowPos(hwnd, 0, x, y, right - left, bottom - top, flags)
+        elif kind == "frame":
+            win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, _int32(style & ~self._STRIP_STYLE))
+            win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags | win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_FRAMECHANGED)
+        elif kind == "child":
+            win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, _int32((style & ~win32con.WS_POPUP) | win32con.WS_CHILD | win32con.WS_VISIBLE))
+            win32gui.SetParent(hwnd, host_hwnd)
+        else:
+            raise ValueError(kind)
+        after = win32gui.GetWindowRect(hwnd)
+        return f"{kind}: window rect {before} -> {after}"
+
     def fit_to_host(self) -> None:
         """Make the embedded window exactly cover the host's client area."""
         if not (IS_WINDOWS and self.host_hwnd and self.window_exists() and self._saved):

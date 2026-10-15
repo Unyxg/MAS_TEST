@@ -72,7 +72,7 @@ except ImportError:
 # Frozen (PyInstaller) builds keep config.yaml and temp_evidence next to the .exe.
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
-MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Find window only (no changes)", "find"), ("Launch only (hands off)", "none")]
+MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Find window only (no changes)", "find"), ("Test A: resize only", "exp_resize"), ("Test B: frame only", "exp_frame"), ("Test C: child only", "exp_child"), ("Launch only (hands off)", "none")]
 RUN_AS_CHOICES = [
     ("Run as: me", run_as.RUN_AS_CURRENT),
     ("Run as: administrator", run_as.RUN_AS_ADMIN),
@@ -711,6 +711,18 @@ class MainWindow(QMainWindow):
         return run_as.Credentials.parse(dialog.account, dialog.password)
 
     def _embed_window(self, hwnd: Optional[int] = None) -> None:
+        if self.embed_mode.startswith("exp_"):  # diagnostic: apply exactly one embedding step
+            try:
+                note = self.window_manager.experiment(
+                    self.embed_mode[4:], self.host_frame.native_handle(), hwnd or self.window_manager.hwnd
+                )
+            except Exception as exc:
+                self._show_error(f"Experiment failed: {exc}")
+                return
+            log.info("Experiment %s", note)
+            self.statusBar().showMessage(f"Experiment applied - {note}")
+            self._update_controls()
+            return
         if self.embed_mode == "find":  # diagnostic: found the window, leave it exactly as it is
             self.statusBar().showMessage("Found the window - leaving it untouched (Find window only)")
             self._update_controls()
