@@ -72,7 +72,7 @@ except ImportError:
 # Frozen (PyInstaller) builds keep config.yaml and temp_evidence next to the .exe.
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
-MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock")]
+MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Launch only (hands off)", "none")]
 RUN_AS_CHOICES = [
     ("Run as: me", run_as.RUN_AS_CURRENT),
     ("Run as: administrator", run_as.RUN_AS_ADMIN),
@@ -644,6 +644,11 @@ class MainWindow(QMainWindow):
             self._show_error(f"Could not launch {self.exe_path}: {exc}")
             return
 
+        if self.embed_mode == "none":
+            # Diagnostic mode: start the application and do nothing else to it (no window search, no re-parenting).
+            self.statusBar().showMessage(f"Started PID {self.window_manager.pid} - not touching its window (Launch only)")
+            self._update_controls()
+            return
         self.launch_btn.setEnabled(False)
         self._update_controls()
         self._run_task(
