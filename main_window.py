@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
-from PyQt6.QtCore import QObject, QPoint, QRunnable, QSettings, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRunnable, QSettings, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QMoveEvent, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -72,7 +72,7 @@ except ImportError:
 # Frozen (PyInstaller) builds keep config.yaml and temp_evidence next to the .exe.
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
-MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Find window only (no changes)", "find"), ("Test A: resize only", "exp_resize"), ("Test B: frame only", "exp_frame"), ("Test C: child only", "exp_child"), ("Launch only (hands off)", "none")]
+MODES = [("Align (keeps its own frame)", "align"), ("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Find window only (no changes)", "find"), ("Test A: resize only", "exp_resize"), ("Test B: frame only", "exp_frame"), ("Test C: child only", "exp_child"), ("Launch only (hands off)", "none")]
 RUN_AS_CHOICES = [
     ("Run as: me", run_as.RUN_AS_CURRENT),
     ("Run as: administrator", run_as.RUN_AS_ADMIN),
@@ -421,7 +421,7 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox()
         for label, mode in MODES:
             self.mode_combo.addItem(label, mode)
-        configured = str(self.app_cfg.get("embed_mode", "reparent"))
+        configured = str(self.app_cfg.get("embed_mode", "align"))
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(configured)))
         self.mode_combo.setToolTip(
             "Embed: true child window (SetParent).\nDock: borderless window glued over the frame - "
@@ -563,7 +563,7 @@ class MainWindow(QMainWindow):
         self.check_btn.setEnabled(self.ado_client is not None)
         who = f" · {wm.run_as_label}" if wm.run_as_label else ""
         if embedded:
-            self.app_state.set_state(f"{'Embedded' if wm.mode == 'reparent' else 'Docked'} · PID {wm.pid}{who}", "ok")
+            self.app_state.set_state(f"{ {'reparent': 'Embedded', 'dock': 'Docked', 'align': 'Aligned'}.get(wm.mode, wm.mode) } · PID {wm.pid}{who}", "ok")
         elif has_window:
             self.app_state.set_state(f"Separate window · PID {wm.pid}{who}", "info")
         elif wm.pid is not None:
@@ -816,8 +816,13 @@ class MainWindow(QMainWindow):
 
     def moveEvent(self, event: QMoveEvent) -> None:  # keeps a docked window glued to the frame
         super().moveEvent(event)
-        if self.window_manager.mode == "dock":
+        if self.window_manager.mode in ("dock", "align"):
             self.window_manager.fit_to_host()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self.window_manager.raise_over_dashboard()
 
     def _keep_dashboard_usable(self) -> None:
         if self.window_manager.keep_dashboard_enabled():

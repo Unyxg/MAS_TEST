@@ -50,7 +50,7 @@ _DWMWA_CLOAKED = 14
 _MIN_WINDOW_SIDE = 50  # px - ignore tiny helper / message windows
 _GWLP_HWNDPARENT = -8  # owner slot of a top-level window
 
-EMBED_MODES = ("reparent", "dock")
+EMBED_MODES = ("reparent", "dock", "align")
 
 
 class EmbedError(RuntimeError):
@@ -357,7 +357,9 @@ class WindowManager:
         new_ex_style = ex_style & ~_STRIP_EX_STYLE
 
         try:
-            if mode == "reparent":
+            if mode == "align":
+                pass  # no style, owner or parent change at all: the window is only positioned (see fit_to_host)
+            elif mode == "reparent":
                 # Per the SetParent docs: clear WS_POPUP and set WS_CHILD *before* re-parenting.
                 new_style = (style & ~_STRIP_STYLE) | win32con.WS_CHILD | win32con.WS_VISIBLE
                 win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, _int32(new_style))
@@ -423,21 +425,13 @@ class WindowManager:
         left, top, right, bottom = win32gui.GetClientRect(self.host_hwnd)
         width, height = max(1, right - left), max(1, bottom - top)
         x, y = 0, 0
-        if self.mode == "dock":
+        if self.mode in ("dock", "align"):
             x, y = win32gui.ClientToScreen(self.host_hwnd, (0, 0))
+        flags = win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
+        if self.mode != "align":
+            flags |= win32con.SWP_FRAMECHANGED
         try:
-            win32gui.SetWindowPos(
-                self.hwnd,
-                win32con.HWND_TOP,
-                x,
-                y,
-                width,
-                height,
-                win32con.SWP_NOZORDER
-                | win32con.SWP_NOACTIVATE
-                | win32con.SWP_FRAMECHANGED
-                | win32con.SWP_SHOWWINDOW,
-            )
+            win32gui.SetWindowPos(self.hwnd, win32con.HWND_TOP, x, y, width, height, flags)
         except pywintypes.error as exc:
             log.debug("fit_to_host failed: %s", exc)
 
@@ -764,6 +758,17 @@ class WindowManager:
                 pass  # needs AttachThreadInput for some apps; clicking inside works regardless
 
     # --------------------------------------------------------------- release
+    def raise_over_dashboard(self) -> None:
+        """Align mode: bring the application back above the dashboard (it is a separate top-level window)."""
+        if IS_WINDOWS and self.mode == "align" and self._saved and self.window_exists():
+            try:
+                win32gui.SetWindowPos(
+                    self.hwnd, win32con.HWND_TOP, 0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE,
+                )
+            except pywintypes.error:
+                pass
+
     def release(self) -> None:
         """Un-embed the window and restore its original parent/styles/position."""
         if not IS_WINDOWS or self._saved is None:
@@ -776,9 +781,10 @@ class WindowManager:
             try:
                 if self.mode == "reparent":
                     win32gui.SetParent(saved.hwnd, 0)
-                else:
+                elif self.mode == "dock":
                     _set_owner(saved.hwnd, saved.owner)
-                self._restore_styles()
+                if self.mode != "align":
+                    self._restore_styles()
                 left, top, right, bottom = saved.rect
                 win32gui.SetWindowPos(
                     saved.hwnd,
@@ -787,7 +793,7 @@ class WindowManager:
                     top,
                     right - left,
                     bottom - top,
-                    win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW,
+                    (0 if self.mode == "align" else win32con.SWP_FRAMECHANGED) | win32con.SWP_SHOWWINDOW,
                 )
                 log.info("Released window 0x%08X back to the desktop", saved.hwnd)
             except pywintypes.error as exc:
