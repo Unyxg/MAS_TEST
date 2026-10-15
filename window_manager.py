@@ -386,6 +386,147 @@ class WindowManager:
         except pywintypes.error as exc:
             log.debug("fit_to_host failed: %s", exc)
 
+    # ------------------------------------------------------------ diagnostics
+    _STYLE_FLAGS = {
+        0x40000000: "CHILD", 0x80000000: "POPUP", 0x10000000: "VISIBLE", 0x08000000: "DISABLED",
+        0x00C00000: "CAPTION", 0x00040000: "THICKFRAME", 0x02000000: "CLIPCHILDREN", 0x04000000: "CLIPSIBLINGS",
+        0x01000000: "MAXIMIZE", 0x20000000: "MINIMIZE", 0x00100000: "VSCROLL", 0x00200000: "HSCROLL",
+    }
+    _EX_FLAGS = {
+        0x00080000: "LAYERED", 0x00000020: "TRANSPARENT", 0x00000080: "TOOLWINDOW", 0x08000000: "NOACTIVATE",
+        0x02000000: "COMPOSITED", 0x00200000: "NOREDIRECTIONBITMAP", 0x00040000: "APPWINDOW", 0x00000008: "TOPMOST",
+    }
+
+    @staticmethod
+    def _flags(value: int, table: dict[int, str]) -> str:
+        value &= 0xFFFFFFFF
+        return "|".join(name for bit, name in table.items() if value & bit == bit) or "-"
+
+    @staticmethod
+    def _dpi(hwnd: int) -> str:
+        """DPI awareness of the process that owns ``hwnd`` and the DPI the window runs at."""
+        user32 = ctypes.windll.user32
+        names = {-1: "invalid", 0: "UNAWARE", 1: "SYSTEM-aware", 2: "PER-MONITOR-aware"}
+        try:
+            user32.GetWindowDpiAwarenessContext.restype = ctypes.c_void_p
+            user32.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            context = user32.GetWindowDpiAwarenessContext(ctypes.c_void_p(hwnd))
+            awareness = names.get(user32.GetAwarenessFromDpiAwarenessContext(ctypes.c_void_p(context)), "?")
+            dpi = user32.GetDpiForWindow(ctypes.c_void_p(hwnd))
+            return f"{awareness}, {dpi} dpi ({round(dpi * 100 / 96)}%)"
+        except (AttributeError, OSError):
+            return "unknown"
+
+    def diagnostics_report(self, dashboard_hwnd: Optional[int] = None) -> str:
+        """A plain-text description of the embedded application's windows, for troubleshooting.
+
+        Records what Windows reports: sizes, DPI awareness, styles and every child window - enough to
+        tell a layout/size problem from a re-parenting or scaling problem when a page of the
+        application draws incompletely.
+        """
+        _require_windows()
+        out: list[str] = [f"MAS-QA-Bridge embed diagnostics - {time.strftime('%Y-%m-%d %H:%M:%S')}"]
+        pids = self.candidate_pids()
+
+        def rect(hwnd: int) -> str:
+            try:
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                return f"({l},{t}) {r - l}x{b - t}"
+            except pywintypes.error:
+                return "?"
+
+        def describe(hwnd: int) -> str:
+            try:
+                style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                text = win32gui.GetWindowText(hwnd)[:40]
+                return (
+                    f"0x{hwnd:X} {win32gui.GetClassName(hwnd)!r} {text!r} {rect(hwnd)} "
+                    f"vis={bool(win32gui.IsWindowVisible(hwnd))} en={bool(win32gui.IsWindowEnabled(hwnd))} "
+                    f"style={self._flags(style, self._STYLE_FLAGS)} ex={self._flags(ex_style, self._EX_FLAGS)}"
+                )
+            except pywintypes.error:
+                return f"0x{hwnd:X} (gone)"
+
+        out += ["", "== Dashboard =="]
+        if dashboard_hwnd:
+            out.append(f"window: {describe(dashboard_hwnd)}")
+            out.append(f"DPI: {self._dpi(dashboard_hwnd)}")
+        out.append(f"run as: {run_as.current_account()} elevated={run_as.is_admin()}")
+
+        out += ["", "== Application under test =="]
+        out.append(f"exe: {self.exe_path}   pid: {self.pid}   mode: {self.mode}   started as: {self.run_as_label or '?'}")
+        out.append(f"elevated: {self.target_elevated}   all pids: {sorted(pids)}")
+        for pid in sorted(pids):
+            try:
+                proc = psutil.Process(pid)
+                out.append(f"  process {pid}: {proc.name()} user={proc.username()}")
+            except psutil.Error:
+                pass
+        if not (self.hwnd and win32gui.IsWindow(self.hwnd)):
+            out.append("(the application window no longer exists)")
+            return "\n".join(out)
+
+        hwnd = self.hwnd
+        out.append(f"main window: {describe(hwnd)}")
+        out.append(f"  DPI: {self._dpi(hwnd)}")
+        try:
+            out.append(f"  client area: {win32gui.GetClientRect(hwnd)}   parent: 0x{win32gui.GetParent(hwnd):X}"
+                       f"   owner: 0x{win32gui.GetWindow(hwnd, win32con.GW_OWNER):X}")
+        except pywintypes.error:
+            pass
+        if self.host_hwnd:
+            out.append(f"host frame (the dashboard's application area): {describe(self.host_hwnd)}")
+            try:
+                hl, ht, hr, hb = win32gui.GetClientRect(self.host_hwnd)
+                out.append(f"  host client area: {hr - hl}x{hb - ht}")
+            except pywintypes.error:
+                pass
+        if self._saved is not None:
+            l, t, r, b = self._saved.rect
+            out.append(f"size before embedding: {r - l}x{b - t}   original style: "
+                       f"{self._flags(self._saved.style, self._STYLE_FLAGS)}")
+
+        children: list[int] = []
+        try:
+            win32gui.EnumChildWindows(hwnd, lambda h, _: children.append(h) or True, None)
+        except pywintypes.error:
+            pass
+        out += ["", f"== Child windows of the main window ({len(children)}) =="]
+
+        def depth(h: int) -> int:
+            d, cur = 0, h
+            while d < 30:
+                cur = win32gui.GetParent(cur)
+                if not cur or cur == hwnd:
+                    return d
+                d += 1
+            return d
+
+        for h in children[:300]:
+            try:
+                out.append("  " * (depth(h) + 1) + describe(h))
+            except pywintypes.error:
+                pass
+        if len(children) > 300:
+            out.append(f"  ... {len(children) - 300} more")
+
+        others: list[int] = []
+
+        def collect(h: int, _: object) -> bool:
+            try:
+                if h != hwnd and win32process.GetWindowThreadProcessId(h)[1] in pids:
+                    others.append(h)
+            except pywintypes.error:
+                pass
+            return True
+
+        win32gui.EnumWindows(collect, None)
+        out += ["", f"== Other top-level windows of the application ({len(others)}) =="]
+        for h in others[:60]:
+            out.append("  " + describe(h) + f" owner=0x{win32gui.GetWindow(h, win32con.GW_OWNER):X}")
+        return "\n".join(out)
+
     def keep_dashboard_enabled(self) -> bool:
         """Undo the "disabled dashboard" caused by the embedded application's modal dialogs.
 

@@ -107,6 +107,10 @@ def main() -> int:
         check("reparent: caption removed", not style & win32con.WS_CAPTION)
         desktop_png("1_reparent")
 
+        report = wm.diagnostics_report(int(window.winId()))
+        (OUT / "embed_diagnostics.txt").write_text(report, encoding="utf-8")
+        check("diagnostics report lists the window tree", "== Child windows" in report and " dpi (" in report,
+              f"{len(report.splitlines())} lines")
         window._refresh_capture_region()
         shot = window.recorder.screenshot("embedded_screenshot")
         check("screenshot of host area", shot.stat().st_size > 1000, f"{shot.name} {shot.stat().st_size} B")

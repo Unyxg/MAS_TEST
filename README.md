@@ -204,6 +204,15 @@ The account the app ran as is added to every bug's **Environment** section ("App
 
 Microsoft doesn't recommend cross-process `SetParent`: the two apps' input queues get linked, so if one freezes the other can too. Dock mode avoids this, so try it if an app behaves oddly when embedded.
 
+## When a page of the application draws incorrectly in the dashboard
+
+Some applications draw part of a page with separate child windows (older Windows controls such as classic text boxes and drop-downs). Embedding can confuse them, or a different DPI scaling between the dashboard and the application can displace them. Quick checks:
+
+1. Switch the header to **Dock (overlay)**. The application then keeps its own window (placed over the panel), so this class of problem disappears.
+2. Click **Pop out**: if the page is fine on the desktop, the problem is specific to embedding.
+3. Hide the Test Explorer (**Ctrl+E**) or enlarge the dashboard: if the page then draws, the application needs more room than the panel gave it.
+4. With the broken page on screen, open **Log → Diagnose application window** (Ctrl+Shift+D). It saves a report of the application's windows (sizes, DPI awareness, every child window) in the evidence folder and copies it to the clipboard - send that file along with a screenshot.
+
 ## Known limitations
 
 - A dashboard that isn't running as administrator cannot embed an elevated app (UIPI). Use *Restart as administrator*.

@@ -363,7 +363,22 @@ class MainWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(3000)
         self.log_dock = QDockWidget("Log", self)
-        self.log_dock.setWidget(self.log_view)
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(6, 4, 6, 6)
+        log_layout.setSpacing(4)
+        log_tools = QHBoxLayout()
+        self.diagnose_btn = QPushButton("Diagnose application window (Ctrl+Shift+D)")
+        self.diagnose_btn.setToolTip(
+            "Saves a report of the embedded application's windows (sizes, DPI, child windows) and copies it "
+            "to the clipboard - send it when a page of the application does not draw correctly."
+        )
+        self.diagnose_btn.clicked.connect(self.diagnose_window)
+        log_tools.addWidget(self.diagnose_btn)
+        log_tools.addStretch()
+        log_layout.addLayout(log_tools)
+        log_layout.addWidget(self.log_view)
+        self.log_dock.setWidget(log_panel)
         self.log_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.log_dock.hide()
@@ -468,6 +483,7 @@ class MainWindow(QMainWindow):
             "Ctrl+L": lambda: self.log_btn.toggle(),
             "Ctrl+B": lambda: self.open_bug_dialog(),
             "Ctrl+E": lambda: self.toggle_explorer(),
+            "Ctrl+Shift+D": lambda: self.diagnose_window(),
         }
         for keys, slot in bindings.items():
             shortcut = QShortcut(QKeySequence(keys), self)
@@ -693,6 +709,30 @@ class MainWindow(QMainWindow):
         except EmbedError as exc:
             self._show_error(str(exc))
         self._update_controls()
+
+    def diagnose_window(self) -> None:
+        """Write a report of the application's windows next to the evidence and copy it to the clipboard."""
+        wm = self.window_manager
+        if not IS_WINDOWS or not wm.window_exists():
+            QMessageBox.information(self, APP_NAME, "There is no application window to diagnose. Launch the application first.")
+            return
+        try:
+            report = wm.diagnostics_report(int(self.winId()))
+        except Exception as exc:
+            self._show_error(f"Could not collect diagnostics: {exc}")
+            return
+        report += f"\n\n(build {BUILD_ID or 'source'}; embed mode: {self.embed_mode})"
+        self.recorder.output_dir.mkdir(parents=True, exist_ok=True)
+        path = self.recorder.output_dir / f"embed_diagnostics_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        path.write_text(report, encoding="utf-8")
+        QApplication.clipboard().setText(report)
+        log.info("Diagnostics saved to %s", path)
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            f"Saved to:\n{path}\n\nThe report is also on the clipboard. Do this while the page that draws "
+            "incorrectly is on screen, then send the file.",
+        )
 
     def toggle_release(self) -> None:
         if self.window_manager.is_embedded:
