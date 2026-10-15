@@ -72,7 +72,7 @@ except ImportError:
 # Frozen (PyInstaller) builds keep config.yaml and temp_evidence next to the .exe.
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
-MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Launch only (hands off)", "none")]
+MODES = [("Embed (SetParent)", "reparent"), ("Dock (overlay)", "dock"), ("Find window only (no changes)", "find"), ("Launch only (hands off)", "none")]
 RUN_AS_CHOICES = [
     ("Run as: me", run_as.RUN_AS_CURRENT),
     ("Run as: administrator", run_as.RUN_AS_ADMIN),
@@ -199,7 +199,10 @@ class MainWindow(QMainWindow):
         self.pool = QThreadPool.globalInstance()
         self._tasks: set[Task] = set()
 
-        self.window_manager = WindowManager(find_timeout=float(self.app_cfg.get("window_find_timeout_seconds", 20)))
+        self.window_manager = WindowManager(
+            find_timeout=float(self.app_cfg.get("window_find_timeout_seconds", 20)),
+            settle_seconds=float(self.app_cfg.get("settle_seconds", 6)),
+        )
 
         output_dir = Path(self.ev_cfg.get("output_dir") or "temp_evidence")
         if not output_dir.is_absolute():
@@ -708,6 +711,10 @@ class MainWindow(QMainWindow):
         return run_as.Credentials.parse(dialog.account, dialog.password)
 
     def _embed_window(self, hwnd: Optional[int] = None) -> None:
+        if self.embed_mode == "find":  # diagnostic: found the window, leave it exactly as it is
+            self.statusBar().showMessage("Found the window - leaving it untouched (Find window only)")
+            self._update_controls()
+            return
         allowed, reason = self.window_manager.can_embed()
         if not allowed:
             # Elevated app with a non-elevated dashboard: leave it as its own window.

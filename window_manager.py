@@ -126,8 +126,9 @@ def _is_cloaked(hwnd: int) -> bool:
 class WindowManager:
     """Owns the lifecycle of one launched + embedded external application."""
 
-    def __init__(self, find_timeout: float = 20.0, poll_interval: float = 0.25) -> None:
+    def __init__(self, find_timeout: float = 20.0, poll_interval: float = 0.25, settle_seconds: float = 0.0) -> None:
         self.find_timeout = find_timeout
+        self.settle_seconds = settle_seconds
         self.poll_interval = poll_interval
 
         self.exe_path: Optional[str] = None
@@ -255,6 +256,10 @@ class WindowManager:
                 raise EmbedError(f"Target process exited before showing a window (exit code {code}).")
             hwnd = self._best_window(pids, title_contains)
             if hwnd:
+                self._let_application_settle()
+                if not win32gui.IsWindow(hwnd):  # a splash screen closed while we waited: look again
+                    continue
+                hwnd = self._best_window(self.candidate_pids(), title_contains) or hwnd
                 self.hwnd = hwnd
                 log.info(
                     "Found window 0x%08X '%s' (PID %s)",
@@ -268,6 +273,21 @@ class WindowManager:
         raise EmbedError(
             f"No visible top-level window appeared for PID {self.pid} within the timeout."
         )
+
+    def _let_application_settle(self) -> None:
+        """Wait until the application's UI thread is idle, then a fixed time, before anything touches its window.
+
+        Changing a window's frame/size while the application is still building its forms can leave
+        parts of it (lazily created option pages) without controls."""
+        if self.settle_seconds <= 0 or not self.process:
+            return
+        try:
+            handle = getattr(self.process.handle, "_handle", None) or int(self.process.handle)
+            ctypes.windll.user32.WaitForInputIdle(ctypes.c_void_p(handle), 15000)
+        except Exception as exc:  # best effort
+            log.debug("WaitForInputIdle failed: %s", exc)
+        log.info("Waiting %.0f s for the application to finish starting before touching its window", self.settle_seconds)
+        time.sleep(self.settle_seconds)
 
     def _best_window(self, pids: set[int], title_contains: Optional[str]) -> Optional[int]:
         """Pick the largest visible, unowned, titled top-level window of ``pids``."""

@@ -45,6 +45,7 @@ app:
   launch_args: []                        # e.g. ["--test-mode"]
   window_title_contains: ""              # optional filter to skip splash screens
   window_find_timeout_seconds: 20
+  settle_seconds: 6                      # wait this long (after the app is idle) before embedding/docking; 0 = immediately
   embed_mode: "reparent"                 # reparent (SetParent) | dock (overlay)
   run_as: "current"                      # current | admin | user (default of the "Run as" selector)
   run_as_account: ""                     # e.g. "CONTOSO\\qa.tester2" pre-filled for "different user"
