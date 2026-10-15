@@ -214,6 +214,13 @@ def main() -> int:
             user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
             user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
 
+        # The runner's screen is small (1024x768): click a button in the dashboard's left panel, which is
+        # on-screen, and count its signal instead of relying on a side effect.
+        window.move(0, 0)
+        clicks: list[int] = []
+        window.explorer.refresh_requested.connect(lambda: clicks.append(1))
+        button = window.explorer.refresh_btn
+
         cases = [("reparent", 0, False), ("reparent", 0, True), ("dock", 1, True)]
         for mode_name, mode_index, guard in cases:
             label = f"{mode_name}, guard {'on' if guard else 'OFF (experiment)'}"
@@ -235,13 +242,13 @@ def main() -> int:
             pump(app, 0.8)  # give the guard time to act
 
             enabled = bool(win32gui.IsWindowEnabled(root_hwnd))
-            before = window.evidence_panel.list.count()
-            real_click(window.evidence_panel.shot_btn)
-            pump(app, 1.5)
-            clicked = window.evidence_panel.list.count() > before
+            before = len(clicks)
+            real_click(button)
+            pump(app, 1.0)
+            clicked = len(clicks) > before
             required = guard  # without the guard it is an experiment (we expect it to be broken)
             check(f"{label}: dashboard window is enabled while the popup is open", enabled, required=required)
-            check(f"{label}: real click on 'Screenshot' works while the popup is open", clicked, required=required)
+            check(f"{label}: real mouse click on a dashboard button works while the popup is open", clicked, required=required)
             desktop_png(f"4_popup_{mode_name}_guard_{'on' if guard else 'off'}")
 
             win32gui.PostMessage(popup, win32con.WM_CLOSE, 0, 0)
