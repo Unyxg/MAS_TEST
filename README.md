@@ -211,7 +211,8 @@ Some applications draw part of a page with separate child windows (older Windows
 1. Switch the header to **Dock (overlay)**. The application then keeps its own window (placed over the panel), so this class of problem disappears.
 2. Click **Pop out**: if the page is fine on the desktop, the problem is specific to embedding.
 3. Hide the Test Explorer (**Ctrl+E**) or enlarge the dashboard: if the page then draws, the application needs more room than the panel gave it.
-4. With the broken page on screen, open **Log → Diagnose application window** (Ctrl+Shift+D). It saves a report of the application's windows (sizes, DPI awareness, every child window) in the evidence folder and copies it to the clipboard - send that file along with a screenshot.
+4. If the application behaves differently when started from the dashboard than when you start it yourself, a program started by the dashboard inherits the dashboard's account and elevation, so **start the dashboard the same way you start the application** (same account, same "Run as administrator" choice) and keep **Run as: me**. To compare how the two were started, open **Log → Compare how the application was started** (Ctrl+Shift+P) once with the application started from the dashboard and once with a copy you started yourself. It lists account, folder, session, elevation and the *names* of the environment variables (never their values). Start the dashboard as administrator so it can read other accounts' processes.
+5. With the broken page on screen, open **Log → Diagnose application window** (Ctrl+Shift+D). It saves a report of the application's windows (sizes, DPI awareness, every child window) in the evidence folder and copies it to the clipboard - send that file along with a screenshot.
 
 ## Known limitations
 

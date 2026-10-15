@@ -111,6 +111,11 @@ def main() -> int:
         (OUT / "embed_diagnostics.txt").write_text(report, encoding="utf-8")
         check("diagnostics report lists the window tree", "== Child windows" in report and " dpi (" in report,
               f"{len(report.splitlines())} lines")
+        facts = wm.process_facts_report("notepad.exe")
+        (OUT / "process_facts.txt").write_text(facts, encoding="utf-8")
+        check("process facts: account, token and environment names", "integrity level:" in facts and "other variable names:" in facts
+              and os.environ.get("SMOKE_PASS", "\0") not in facts, f"{len(facts.splitlines())} lines")
+        check("diagnostics include the page-stack section", "== Stacked pages" in report)
         window._refresh_capture_region()
         shot = window.recorder.screenshot("embedded_screenshot")
         check("screenshot of host area", shot.stat().st_size > 1000, f"{shot.name} {shot.stat().st_size} B")

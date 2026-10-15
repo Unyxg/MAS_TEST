@@ -375,6 +375,14 @@ class MainWindow(QMainWindow):
         )
         self.diagnose_btn.clicked.connect(self.diagnose_window)
         log_tools.addWidget(self.diagnose_btn)
+        self.facts_btn = QPushButton("Compare how the application was started (Ctrl+Shift+P)")
+        self.facts_btn.setToolTip(
+            "Describes every running copy of the application (account, folder, session, elevation, environment "
+            "variable NAMES) - run it once with the application started from here and once with a copy you "
+            "started yourself, then compare. No variable values or secrets are included."
+        )
+        self.facts_btn.clicked.connect(self.process_facts)
+        log_tools.addWidget(self.facts_btn)
         log_tools.addStretch()
         log_layout.addLayout(log_tools)
         log_layout.addWidget(self.log_view)
@@ -484,6 +492,7 @@ class MainWindow(QMainWindow):
             "Ctrl+B": lambda: self.open_bug_dialog(),
             "Ctrl+E": lambda: self.toggle_explorer(),
             "Ctrl+Shift+D": lambda: self.diagnose_window(),
+            "Ctrl+Shift+P": lambda: self.process_facts(),
         }
         for keys, slot in bindings.items():
             shortcut = QShortcut(QKeySequence(keys), self)
@@ -732,6 +741,32 @@ class MainWindow(QMainWindow):
             APP_NAME,
             f"Saved to:\n{path}\n\nThe report is also on the clipboard. Do this while the page that draws "
             "incorrectly is on screen, then send the file.",
+        )
+
+    def process_facts(self) -> None:
+        """Describe every running copy of the application, to compare how each was started."""
+        if not IS_WINDOWS:
+            return
+        name = os.path.basename(self.exe_path) if self.exe_path else ""
+        if not name:
+            QMessageBox.information(self, APP_NAME, "Select the application (Browse…) first.")
+            return
+        try:
+            report = self.window_manager.process_facts_report(name)
+        except Exception as exc:
+            self._show_error(f"Could not collect process facts: {exc}")
+            return
+        report += f"\n\n(build {BUILD_ID or 'source'})"
+        self.recorder.output_dir.mkdir(parents=True, exist_ok=True)
+        path = self.recorder.output_dir / f"process_facts_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        path.write_text(report, encoding="utf-8")
+        QApplication.clipboard().setText(report)
+        log.info("Process facts saved to %s", path)
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            f"Saved to:\n{path}\n\nAlso on the clipboard. Variable values are not included, only names "
+            "(plus a few harmless ones such as the user name and folders).",
         )
 
     def toggle_release(self) -> None:

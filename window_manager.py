@@ -23,11 +23,12 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import psutil
 
@@ -417,6 +418,115 @@ class WindowManager:
         except (AttributeError, OSError):
             return "unknown"
 
+    # Environment variables whose values are safe and useful to show; every other variable is listed
+    # by NAME only (values can hold secrets, e.g. a personal access token in ADO_PAT).
+    _SAFE_ENV = ("USERNAME", "USERDOMAIN", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "COMPUTERNAME",
+                 "SESSIONNAME", "PROCESSOR_ARCHITECTURE", "ProgramData", "HOMEDRIVE", "HOMEPATH", "LOGONSERVER")
+
+    @staticmethod
+    def _token_facts(pid: int) -> list[str]:
+        """Elevation, integrity level and group membership of a process token (read-only)."""
+        import win32api
+        import win32security
+
+        try:
+            handle = win32api.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        except pywintypes.error as exc:
+            return [f"token: not readable ({exc.strerror})"]
+        try:
+            token = win32security.OpenProcessToken(handle, win32con.TOKEN_QUERY)
+            out = []
+            elevated = bool(win32security.GetTokenInformation(token, 20))  # TokenElevation
+            kind = {1: "default (UAC off or standard user)", 2: "FULL (elevated)", 3: "LIMITED (filtered admin token)"}
+            out.append(f"elevated: {elevated}   elevation type: "
+                       f"{kind.get(win32security.GetTokenInformation(token, 18), '?')}")  # TokenElevationType
+            sid, _ = win32security.GetTokenInformation(token, 25)  # TokenIntegrityLevel
+            rid = sid.GetSubAuthority(sid.GetSubAuthorityCount() - 1)
+            levels = {0x1000: "Low", 0x2000: "Medium", 0x2100: "Medium+", 0x3000: "High", 0x4000: "System"}
+            out.append(f"integrity level: {levels.get(rid, hex(rid))}")
+            groups, admin = [], False
+            for gsid, attrs in win32security.GetTokenInformation(token, 2):  # TokenGroups
+                try:
+                    name, domain, _kind = win32security.LookupAccountSid(None, gsid)
+                except pywintypes.error:
+                    continue
+                enabled = bool(attrs & 0x4) and not attrs & 0x10  # SE_GROUP_ENABLED, not DENY_ONLY
+                if name == "Administrators" and enabled:
+                    admin = True
+                if enabled and not attrs & 0x20:  # skip integrity labels
+                    groups.append(f"{domain}\\{name}")
+            out.append(f"administrators group enabled in this token: {admin}")
+            out.append(f"groups ({len(groups)}): " + "; ".join(groups[:30]))
+            return out
+        except pywintypes.error as exc:
+            return [f"token: not readable ({exc.strerror})"]
+        finally:
+            win32api.CloseHandle(handle)
+
+    def describe_process(self, pid: int) -> list[str]:
+        """How a process was started: account, parent, command line, folder, session, token, environment."""
+        _require_windows()
+        out = [f"--- process {pid} ---"]
+        try:
+            proc = psutil.Process(pid)
+        except psutil.Error as exc:
+            return out + [f"(not available: {exc})"]
+
+        def attempt(label: str, fn: Callable[[], object]) -> None:
+            try:
+                out.append(f"{label}: {fn()}")
+            except (psutil.Error, OSError, pywintypes.error) as exc:
+                out.append(f"{label}: (not readable: {type(exc).__name__})")
+
+        attempt("name / exe", lambda: f"{proc.name()}   {proc.exe()}")
+        attempt("account", proc.username)
+        attempt("started", lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(proc.create_time())))
+        attempt("command line", lambda: subprocess.list2cmdline(proc.cmdline()))
+        attempt("working folder", proc.cwd)
+        attempt("parent", lambda: f"{proc.ppid()} {psutil.Process(proc.ppid()).name()} "
+                                  f"({psutil.Process(proc.ppid()).username()})")
+        try:
+            import win32ts
+
+            out.append(f"session id: {win32ts.ProcessIdToSessionId(pid)}   (this dashboard: "
+                       f"{win32ts.ProcessIdToSessionId(os.getpid())})")
+        except Exception:
+            pass
+        try:
+            out += self._token_facts(pid)
+        except Exception as exc:
+            out.append(f"token: (error {exc})")
+        try:
+            env = proc.environ()
+            out.append(f"environment: {len(env)} variables")
+            for key in self._SAFE_ENV:
+                if key in env:
+                    out.append(f"  {key}={env[key]}")
+            out.append("  other variable names: " + ", ".join(sorted(k for k in env if k not in self._SAFE_ENV)))
+        except (psutil.Error, OSError):
+            out.append("environment: (not readable from this account)")
+        return out
+
+    def process_facts_report(self, image_name: Optional[str] = None) -> str:
+        """Facts for every running process named like the application (and the dashboard), to compare how
+        an instance started by the dashboard differs from one you started yourself."""
+        _require_windows()
+        name = (image_name or (os.path.basename(self.exe_path) if self.exe_path else "")).lower()
+        lines = [f"MAS-QA-Bridge process facts - {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                 f"looking for: {name or '(none)'}   started by the dashboard: pid {self.pid or '-'}"
+                 f" ({self.run_as_label or 'n/a'})", ""]
+        lines += self.describe_process(os.getpid())
+        lines.append("(that was the dashboard itself)")
+        found = [p for p in psutil.process_iter(["pid", "name"]) if name and (p.info.get("name") or "").lower() == name]
+        if not found:
+            lines += ["", f"No running process named {name}."]
+        for proc in found:
+            lines.append("")
+            tag = "STARTED BY THE DASHBOARD" if proc.info["pid"] in self.candidate_pids() else "started some other way"
+            lines.append(f"##### {tag} #####")
+            lines += self.describe_process(proc.info["pid"])
+        return "\n".join(lines)
+
     def diagnostics_report(self, dashboard_hwnd: Optional[int] = None) -> str:
         """A plain-text description of the embedded application's windows, for troubleshooting.
 
@@ -468,6 +578,7 @@ class WindowManager:
             return "\n".join(out)
 
         hwnd = self.hwnd
+        out += self.describe_process(self.pid) if self.pid else []
         out.append(f"main window: {describe(hwnd)}")
         out.append(f"  DPI: {self._dpi(hwnd)}")
         try:
@@ -492,7 +603,42 @@ class WindowManager:
             win32gui.EnumChildWindows(hwnd, lambda h, _: children.append(h) or True, None)
         except pywintypes.error:
             pass
-        out += ["", f"== Child windows of the main window ({len(children)}) =="]
+        # ---- pages stacked on top of each other: is the one on top empty?
+        controls = ("STATIC", "BUTTON", "EDIT", "COMBOBOX", "LISTBOX", "RICHEDIT", "SYSLISTVIEW", "SYSTREEVIEW", "SYSTABCONTROL")
+        kids: dict[int, list[int]] = {}
+        for h in children:  # EnumChildWindows lists siblings top-most first
+            kids.setdefault(win32gui.GetParent(h), []).append(h)
+
+        def has_controls(h: int) -> bool:
+            stack = list(kids.get(h, []))
+            while stack:
+                cur = stack.pop()
+                if any(key in win32gui.GetClassName(cur).upper() for key in controls):
+                    return True
+                stack.extend(kids.get(cur, []))
+            return False
+
+        out += ["", "== Stacked pages (top-most first) =="]
+        stacks = 0
+        for parent, siblings in kids.items():
+            big = []
+            for h in siblings:
+                try:
+                    l, t, r, b = win32gui.GetWindowRect(h)
+                except pywintypes.error:
+                    continue
+                if r - l >= 600 and b - t >= 300 and win32gui.IsWindowVisible(h):
+                    big.append(h)
+            if len(big) >= 3:
+                stacks += 1
+                out.append(f"in 0x{parent:X}:")
+                for position, h in enumerate(big):
+                    state = "has controls" if has_controls(h) else "EMPTY - no controls inside"
+                    out.append(f"  {position + 1}. 0x{h:X} {rect(h)}  {state}{'   <- on top' if position == 0 else ''}")
+        if not stacks:
+            out.append("(none found)")
+
+        out += ["", f"== Child windows of the main window ({len(children)}; first 120 shown) =="]
 
         def depth(h: int) -> int:
             d, cur = 0, h
@@ -503,13 +649,13 @@ class WindowManager:
                 d += 1
             return d
 
-        for h in children[:300]:
+        for h in children[:120]:
             try:
                 out.append("  " * (depth(h) + 1) + describe(h))
             except pywintypes.error:
                 pass
-        if len(children) > 300:
-            out.append(f"  ... {len(children) - 300} more")
+        if len(children) > 120:
+            out.append(f"  ... {len(children) - 120} more")
 
         others: list[int] = []
 
