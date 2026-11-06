@@ -223,7 +223,7 @@ def launch_detached(
         ["cmd.exe", "/c", "start", "", "/D", cwd or os.path.dirname(exe_path), exe_path, *args],
         cwd=cwd, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         for proc in psutil.process_iter(["pid", "name", "create_time"]):
             info = proc.info
@@ -232,7 +232,7 @@ def launch_detached(
                 label = current_account() + (" (elevated)" if is_admin() else "")
                 return LaunchedProcess(info["pid"], handle, label)
         time.sleep(0.2)
-    raise RuntimeError(f"{image} did not start within 20 seconds when started through 'cmd /c start'.")
+    raise RuntimeError(f"{image} did not start within 60 seconds when started through 'cmd /c start'.")
 
 
 def launch_elevated(

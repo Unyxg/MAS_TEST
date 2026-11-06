@@ -126,7 +126,7 @@ def _is_cloaked(hwnd: int) -> bool:
 class WindowManager:
     """Owns the lifecycle of one launched + embedded external application."""
 
-    def __init__(self, find_timeout: float = 20.0, poll_interval: float = 0.25, settle_seconds: float = 0.0) -> None:
+    def __init__(self, find_timeout: float = 60.0, poll_interval: float = 0.25, settle_seconds: float = 0.0) -> None:
         self.find_timeout = find_timeout
         self.settle_seconds = settle_seconds
         self.poll_interval = poll_interval
@@ -283,7 +283,7 @@ class WindowManager:
             return
         try:
             handle = getattr(self.process.handle, "_handle", None) or int(self.process.handle)
-            ctypes.windll.user32.WaitForInputIdle(ctypes.c_void_p(handle), 15000)
+            ctypes.windll.user32.WaitForInputIdle(ctypes.c_void_p(handle), 60000)
         except Exception as exc:  # best effort
             log.debug("WaitForInputIdle failed: %s", exc)
         log.info("Waiting %.0f s for the application to finish starting before touching its window", self.settle_seconds)

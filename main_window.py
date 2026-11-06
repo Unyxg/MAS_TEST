@@ -200,7 +200,7 @@ class MainWindow(QMainWindow):
         self._tasks: set[Task] = set()
 
         self.window_manager = WindowManager(
-            find_timeout=float(self.app_cfg.get("window_find_timeout_seconds", 20)),
+            find_timeout=float(self.app_cfg.get("window_find_timeout_seconds", 60)),
             settle_seconds=float(self.app_cfg.get("settle_seconds", 6)),
         )
 

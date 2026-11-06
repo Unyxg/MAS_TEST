@@ -44,7 +44,7 @@ app:
   default_executable: ""                 # e.g. 'C:\Program Files\MyApp\MyApp.exe'  (single quotes!)
   launch_args: []                        # e.g. ["--test-mode"]
   window_title_contains: ""              # optional filter to skip splash screens
-  window_find_timeout_seconds: 20
+  window_find_timeout_seconds: 60
   settle_seconds: 6                      # wait this long (after the app is idle) before embedding/docking; 0 = immediately
   embed_mode: "align"                    # align (keeps the app's own frame, recommended for MAS) | reparent (SetParent) | dock (overlay)
   run_as: "current"                      # current | admin | user (default of the "Run as" selector)
